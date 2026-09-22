@@ -39,7 +39,7 @@ ends up on screen.
 
 **Crop to these specs:**
 
-| | |
+| Property | Requirement |
 |---|---|
 | shape | square, 1:1 |
 | size | **512×512px** recommended; **168×168px** is the practical minimum (84pt at 2× on a Retina display) |
@@ -93,7 +93,7 @@ follow from that:
 
 When a photo is framed differently, tune the two numbers rather than re-cropping:
 
-| | |
+| Setting | What it controls |
 |---|---|
 | `focus` | where the **centre** of the crop sits vertically: `0` = top edge, `1` = bottom edge. Lower it for a face high in the frame. Clamped so the crop never leaves the image. |
 | `zoom` | how tight the crop is. `1` uses the largest square that fits; `1.7` is the default; higher crops in further; below `1` is treated as `1`. |
@@ -156,7 +156,7 @@ exits non-zero on failure.
 
 ## Dependencies
 
-| | |
+| Dependency | Required? |
 |---|---|
 | macOS | required — the HUD is AppKit |
 | `swiftc` | required — `xcode-select --install` |
@@ -178,7 +178,7 @@ attached session, the terminal is frontmost, and the screen is not locked. Set
 
 ## Files
 
-| | |
+| File | Purpose |
 |---|---|
 | `notify-stop` | the Stop/Notification hook: builds the notification from the transcript |
 | `bin/claude-hud.swift` | the HUD, the only real source file |
@@ -234,7 +234,7 @@ By default the portrait is seeded from the pane address and the calendar day, so
 keeps the same face all day and the cast rotates overnight. Panes within one tmux session
 get different members, since the seed is the full address rather than the session name.
 
-| `--member` | behaviour |
+| `--member` | Behaviour |
 |---|---|
 | *(omitted)* | seeded from pane address + day (default) |
 | `hash` | stable per tmux session, never rotates |
