@@ -1,0 +1,8 @@
+# Architecture-specific; rebuilt by install.sh
+bin/claude-hud
+
+# Third-party images are never committed here — see README
+portraits/
+
+notification-payloads.jsonl
+.DS_Store

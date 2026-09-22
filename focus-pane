@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Bring a tmux pane to the front, and clear whatever announced it.
+# Usage: focus-pane <pane-id> [notification-group]
+set -uo pipefail
+# terminal-notifier's -execute runs with a bare system PATH, so tmux would not resolve.
+PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
+pane=${1:-}
+group=${2:-}
+[[ -n $pane ]] || exit 0
+
+target=$(tmux display-message -p -t "$pane" '#{session_name}:#{window_index}' 2>/dev/null) || exit 0
+session=${target%%:*}
+
+# Prefer a client already attached to the pane's session — switching some other
+# client would yank an unrelated terminal window to a session nobody asked for.
+# Otherwise take the most recently active client and switch that one.
+client=$(tmux list-clients -F '#{client_session}|#{client_name}' 2>/dev/null \
+  | awk -F'|' -v s="$session" '$1 == s { print $2; exit }')
+if [[ -z $client ]]; then
+  client=$(tmux list-clients -F '#{client_activity}|#{client_name}' 2>/dev/null \
+    | sort -rn | head -1 | cut -d'|' -f2)
+fi
+[[ ${CLAUDE_NOTIFY_DEBUG:-0} == 1 ]] && echo "focus-pane: session=$session client=${client:-none}" >&2
+
+[[ -n $client ]] && tmux switch-client -c "$client" -t "$session" 2>/dev/null
+tmux select-window -t "$target" 2>/dev/null
+tmux select-pane -t "$pane" 2>/dev/null
+
+app=${CLAUDE_TERMINAL_APP:-Ghostty}
+/usr/bin/osascript -e "tell application \"$app\" to activate" >/dev/null 2>&1
+
+# Acting on one surface retires the other: clicking the HUD drops the banner from
+# Notification Center, and clicking the banner closes the HUD still on screen.
+if [[ -n $group ]] && command -v terminal-notifier >/dev/null 2>&1; then
+  terminal-notifier -remove "$group" >/dev/null 2>&1
+fi
+pkill -f "claude-hud.*focus-pane $pane" >/dev/null 2>&1
+
+exit 0

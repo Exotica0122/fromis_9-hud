@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# Stop hook: top-centre HUD when Claude finishes a turn.
+set -uo pipefail
+
+# -P resolves through the symlink install.sh leaves in ~/.claude, so the hook finds
+# its siblings in the checkout rather than wherever it was invoked from.
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+
+# Overridable so the test suite can point at a stub and assert on the arguments
+# instead of flashing real windows.
+HUD=${CLAUDE_HUD_BIN:-$here/bin/claude-hud}
+SECONDS_SHOWN=${CLAUDE_NOTIFY_SECONDS:-5}
+SOUND=${CLAUDE_NOTIFY_SOUND:-Glass}
+VOLUME=${CLAUDE_NOTIFY_VOLUME:-1.0}
+
+JQ=$(command -v jq || echo /opt/homebrew/bin/jq)
+[[ -x $JQ ]] || exit 0
+
+input=$(cat)
+transcript=$("$JQ" -r '.transcript_path // empty' <<<"$input" 2>/dev/null)
+cwd=$("$JQ" -r '.cwd // empty' <<<"$input" 2>/dev/null)
+event=$("$JQ" -r '.hook_event_name // "Stop"' <<<"$input" 2>/dev/null)
+# The field carrying the notification text is not documented, so try the plausible
+# names and fall back to the event type, which the matcher guarantees is one of the
+# "needs you" kinds. CLAUDE_NOTIFY_CAPTURE=1 records raw payloads to confirm it.
+notice=$("$JQ" -r '.message // .notification // .text // .title // empty' <<<"$input" 2>/dev/null)
+kind=$("$JQ" -r '.matcher // .notification_type // .type // empty' <<<"$input" 2>/dev/null)
+if [[ -z $notice ]]; then
+  case $kind in
+    permission_prompt) notice="Needs your permission to continue." ;;
+    idle_prompt)       notice="Waiting for your next instruction." ;;
+    agent_needs_input) notice="An agent needs your input." ;;
+    elicitation*)      notice="Waiting on a dialog." ;;
+    *)                 notice="" ;;
+  esac
+fi
+if [[ ${CLAUDE_NOTIFY_CAPTURE:-0} == 1 ]]; then
+  capture=$here/notification-payloads.jsonl
+  printf '%s\n' "$input" >>"$capture" 2>/dev/null
+  tail -n 40 "$capture" >"$capture.tmp" 2>/dev/null && mv -f "$capture.tmp" "$capture" 2>/dev/null
+fi
+cwd=${cwd:-$PWD}
+
+# Skip entirely when you are already looking at this pane: it is on screen in an
+# attached session, the terminal is frontmost, and the screen is not locked.
+# A pane can be pane_active in a window nobody is viewing, so window_active and
+# session_attached both matter; a locked screen means you walked away.
+if [[ ${CLAUDE_NOTIFY_ALWAYS:-0} != 1 && -n ${TMUX_PANE:-} ]]; then
+  onscreen=$(tmux display-message -p -t "$TMUX_PANE" \
+    '#{pane_active} #{window_active} #{session_attached}' 2>/dev/null)
+  set -- $onscreen
+  if [[ ${1:-0} == 1 && ${2:-0} == 1 && ${3:-0} -ge 1 ]]; then
+    front=$(lsappinfo info -only name "$(lsappinfo front 2>/dev/null)" 2>/dev/null \
+      | sed -E 's/.*"LSDisplayName"="([^"]*)".*/\1/')
+    locked=$(ioreg -n Root -d1 -k CGSSessionScreenIsLocked 2>/dev/null \
+      | grep -c '"CGSSessionScreenIsLocked" = Yes')
+    if [[ $front == "${CLAUDE_TERMINAL_APP:-Ghostty}" && ${locked:-0} == 0 ]]; then
+      [[ ${CLAUDE_NOTIFY_DEBUG:-0} == 1 ]] && echo "notify-stop: skipped, you are watching this pane" >&2
+      exit 0
+    fi
+  fi
+fi
+
+# A git pull can bring a newer source than the compiled binary, and nothing else
+# would notice. Rebuild into a temp file and swap only on success, so a broken
+# source never destroys a working binary. The lock stops sixteen panes racing.
+build_error=""
+src=$HUD.swift
+if [[ -f $src ]] && { [[ ! -x $HUD ]] || [[ $src -nt $HUD ]]; }; then
+  if command -v swiftc >/dev/null 2>&1; then
+    lock=${TMPDIR:-/tmp}/claude-hud-build.lock
+    if mkdir "$lock" 2>/dev/null; then
+      trap 'rm -rf "$lock" 2>/dev/null' EXIT
+      if swiftc -O -o "$HUD.new" "$src" 2>"$lock/err"; then
+        mv -f "$HUD.new" "$HUD"
+      else
+        rm -f "$HUD.new"
+        build_error=$(grep -m1 'error:' "$lock/err" 2>/dev/null | sed 's/^.*error: //')
+        build_error=${build_error:-claude-hud.swift failed to compile}
+      fi
+    fi
+  fi
+fi
+
+[[ -x $HUD ]] || exit 0
+
+repo=$(basename "$cwd")
+branch=$(git -C "$cwd" rev-parse --abbrev-ref HEAD 2>/dev/null)
+
+badge=""
+if [[ -n ${TMUX_PANE:-} ]]; then
+  badge=$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null)
+fi
+
+title="" body=""
+if [[ -n $transcript && -r $transcript ]]; then
+  title=$("$JQ" -r 'select(.type=="ai-title") | .aiTitle' "$transcript" 2>/dev/null | tail -n 1)
+  body=$("$JQ" -r 'select(.type=="assistant") | .message.content[]? | select(.type=="text") | .text | gsub("\\s+"; " ")' \
+      "$transcript" 2>/dev/null \
+    | sed -e 's/^ *//' -e '/^$/d' \
+    | tail -n 1 \
+    | sed -E -e 's/`+//g' -e 's/(^|[[:space:]])#+[[:space:]]+/\1/g' -e 's/\*+//g' \
+    | awk '{ print (length($0) > 180) ? substr($0, 1, 179) "…" : $0 }')
+fi
+
+# A blocked session is structurally different, not just a different colour: no
+# portrait, a deep-red rail and its own glyph, so it cannot be misread as "done".
+if [[ $event == Notification ]]; then
+  glyph="⏸"
+  body=${notice:-Waiting on you.}
+  hud_extra=(--avatar none --accent "${CLAUDE_NOTIFY_BLOCKED_ACCENT:-#96000E}")
+  SECONDS_SHOWN=${CLAUDE_NOTIFY_BLOCKED_SECONDS:-12}
+  SOUND=${CLAUDE_NOTIFY_BLOCKED_SOUND:-Funk}
+else
+  glyph="✳"
+  hud_extra=()
+fi
+
+if [[ -n $build_error ]]; then
+  glyph="⚠"
+  body="HUD rebuild failed — showing the previous build. $build_error"
+  hud_extra=(--avatar none --accent "#96000E")
+  SECONDS_SHOWN=${CLAUDE_NOTIFY_BLOCKED_SECONDS:-12}
+fi
+
+# Notification Center as well as the HUD: the HUD is gone in seconds, the banner
+# survives in history for when you come back. Silent, so the chime is not doubled.
+if [[ ${CLAUDE_NOTIFY_NATIVE:-1} == 1 ]]; then
+  NOTIFIER=$(command -v terminal-notifier || true)
+  subtitle="${badge:+$badge · }$repo${branch:+ · $branch}"
+  group="claude-code-${badge:-$repo}"
+
+  # The HUD is transient and already on your screen; this banner persists in
+  # Notification Center, so it carries no message text by default. A turn that
+  # discussed a token or a .env path would otherwise leave it sitting outside the
+  # terminal. Opt back in with CLAUDE_NOTIFY_NATIVE_BODY=1.
+  if [[ ${CLAUDE_NOTIFY_NATIVE_BODY:-0} == 1 ]]; then
+    banner=${body:-Turn complete.}
+  elif [[ $event == Notification ]]; then
+    banner="Waiting on you${badge:+ — open $badge}"
+  else
+    banner="Finished${badge:+ — open $badge}"
+  fi
+  [[ ${CLAUDE_NOTIFY_DEBUG:-0} == 1 ]] && echo "notify-stop: banner=[$banner]" >&2
+  if [[ -n $NOTIFIER ]]; then
+    # terminal-notifier can run a command on click; osascript cannot.
+    args=(-title "$glyph ${title:-$repo}" -subtitle "$subtitle" -message "$banner"
+          -group "$group")
+    [[ -n ${TMUX_PANE:-} ]] && args+=(-execute "$here/focus-pane $TMUX_PANE $group")
+    [[ -n ${CLAUDE_NOTIFY_NATIVE_SOUND:-} ]] && args+=(-sound "$CLAUDE_NOTIFY_NATIVE_SOUND")
+    "$NOTIFIER" "${args[@]}" >/dev/null 2>&1 &
+  else
+    /usr/bin/osascript - "$glyph ${title:-$repo}" "$subtitle" "$banner" >/dev/null 2>&1 <<'APPLESCRIPT' &
+on run argv
+  display notification (item 3 of argv) with title (item 1 of argv) subtitle (item 2 of argv)
+end run
+APPLESCRIPT
+  fi
+fi
+
+"$HUD" \
+  --title "$glyph ${title:-$repo}" \
+  --badge "$badge" \
+  --repo "$repo" \
+  --branch "$branch" \
+  --body "${body:-Turn complete.}" \
+  --seconds "$SECONDS_SHOWN" \
+  --sound "$SOUND" \
+  --volume "$VOLUME" \
+  ${CLAUDE_NOTIFY_ACCENT:+--accent "$CLAUDE_NOTIFY_ACCENT"} \
+  ${CLAUDE_NOTIFY_MEMBER:+--member "$CLAUDE_NOTIFY_MEMBER"} \
+  ${TMUX_PANE:+--on-click "$here/focus-pane $TMUX_PANE claude-code-${badge:-$repo}"} \
+  ${hud_extra[@]+"${hud_extra[@]}"} \
+  >/dev/null 2>&1 &
+
+# Detached: the hook must not sit for the HUD's whole display time. Its 10s
+# timeout would otherwise cut a 12s blocked notification short.
+disown 2>/dev/null || true
+exit 0
