@@ -13,14 +13,15 @@ portrait, a deep-red rail and its own glyph, so it cannot be misread as "done".
 
 ![Three HUD cards fanned out vertically, each with its own portrait, pane address and message](docs/hud-stack.png)
 
-macOS only — the HUD is AppKit. **Portraits in these screenshots are generated
-placeholders** — the repository ships no photos, as below.
+macOS only — the HUD is AppKit. The screenshots show a configured install; the portraits
+in them are not part of this repository, as below.
 
 ## Portraits are not included
 
 **This repository ships no member photos.** They are third-party images and not mine to
-redistribute. Without them the HUD falls back to a coloured rail per member and works
-exactly the same — adding them is optional.
+redistribute, so nothing here installs them for you — the screenshots above are of my own
+local set. Without portraits the HUD falls back to a coloured rail per member and works
+exactly the same; adding them is optional.
 
 ![The same HUD card with no portrait, showing a narrow coloured rail in its place](docs/hud-rail.png)
 
