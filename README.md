@@ -198,6 +198,7 @@ attached session, the terminal is frontmost, and the screen is not locked. Set
 | `portraits.example/` | `roster.conf` and `crops.conf` templates — no images |
 | `install.sh` | dependency check, build, symlink |
 | `test.sh` | smoke test, no windows drawn; tmux-dependent checks skip themselves |
+| `.github/workflows/ci.yml` | builds and runs the suite on a macOS runner |
 
 ## Blocked notifications
 
