@@ -150,7 +150,9 @@ The compiled binary is deliberately not committed — it is architecture-specifi
 rebuilds in about a second. `notify-stop` also rebuilds it automatically when the source
 is newer, swapping it in only on a successful compile.
 
-Run `./test.sh` after a pull or on a new machine. It points the hook at a stub via
+Run `./test.sh` after a pull or on a new machine; CI runs it on every push and pull
+request against a macOS runner. Assertions that need a live tmux pane skip themselves
+when there is none, so the suite is green both in CI and in a terminal. It points the hook at a stub via
 `CLAUDE_HUD_BIN` and asserts on the arguments, so nothing is drawn on screen, and it
 exits non-zero on failure.
 
@@ -186,7 +188,7 @@ attached session, the terminal is frontmost, and the screen is not locked. Set
 | `hooks.example.json` | the snippet to merge into `settings.json` |
 | `portraits.example/` | `roster.conf` and `crops.conf` templates — no images |
 | `install.sh` | dependency check, build, symlink |
-| `test.sh` | smoke test — 16 assertions, no windows drawn |
+| `test.sh` | smoke test — 18 assertions, no windows drawn |
 
 ## Blocked notifications
 

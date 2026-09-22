@@ -38,7 +38,11 @@ echo "notify-stop"
 args=$(run "$(payload Stop)" CLAUDE_NOTIFY_ALWAYS=1)
 check "a finished turn renders a card"        "$args" "--title"
 check "carries the tmux pane address"         "$args" "--badge"
-check "click jumps to the pane"               "$args" "--on-click"
+if [[ -n ${TMUX_PANE:-} ]]; then
+  check "click jumps to the pane"             "$args" "--on-click"
+else
+  note "skipped: no tmux pane, so there is no click target"
+fi
 absent "no blocked styling on a normal turn"  "$args" "#96000E"
 
 args=$(run "$(payload Notification ',"matcher":"permission_prompt"')" CLAUDE_NOTIFY_ALWAYS=1)
@@ -55,7 +59,8 @@ absent "banner withholds the message body"    "$out" "banner=[Turn complete"
 check  "banner still names the session"       "$out" "banner=[Finished"
 
 echo "skip when you are watching"
-onscreen=$(tmux display-message -p -t "${TMUX_PANE:-}" '#{pane_active}#{window_active}' 2>/dev/null)
+onscreen=$([[ -n ${TMUX_PANE:-} ]] \
+  && tmux display-message -p -t "$TMUX_PANE" '#{pane_active}#{window_active}' 2>/dev/null)
 if [[ $onscreen == 11 ]]; then
   front=$(lsappinfo info -only name "$(lsappinfo front 2>/dev/null)" 2>/dev/null \
     | sed -E 's/.*"LSDisplayName"="([^"]*)".*/\1/')
@@ -83,7 +88,11 @@ fi
 
 echo "paths and roster"
 args=$(run "$(payload Stop)" CLAUDE_NOTIFY_ALWAYS=1)
-check  "resolves its siblings from the checkout" "$args" "$here/focus-pane"
+if [[ -n ${TMUX_PANE:-} ]]; then
+  check "resolves its siblings from the checkout" "$args" "$here/focus-pane"
+else
+  note "skipped: the sibling path only appears on --on-click, which needs a pane"
+fi
 absent "no leftover ~/.claude/hooks path"        "$args" ".claude/hooks"
 
 conf=$tmp/portraits; mkdir -p "$conf"

@@ -1,0 +1,23 @@
+name: build and test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install dependencies
+        run: |
+          command -v jq   >/dev/null || brew install jq
+          command -v tmux >/dev/null || brew install tmux
+
+      - name: build
+        run: swiftc -O -o bin/claude-hud bin/claude-hud.swift
+
+      - name: test
+        run: ./test.sh
