@@ -15,24 +15,107 @@ macOS only — the HUD is AppKit.
 
 **This repository ships no member photos.** They are third-party images and not mine to
 redistribute. Without them the HUD falls back to a coloured rail per member and works
-exactly the same.
+exactly the same — adding them is optional.
 
-To add your own, drop files named for the slug into `~/.claude/portraits/`:
+### 1. Put the file where the HUD looks
+
+Name each file for its slug and drop it in `~/.claude/portraits/`:
 
 ```
-hayoung  jiwon  chaeyoung  nagyung  jiheon
+~/.claude/portraits/
+  hayoung.webp   jiwon.png   chaeyoung.jpg   nagyung.webp   jiheon.heic
 ```
 
-`.webp`, `.png`, `.jpg` and `.heic` all load. If a face sits off-centre, add a line to
+`.webp`, `.png`, `.jpg`, `.jpeg` and `.heic` all load, and the extension does not have to
+match between members. The lookup order is `$CLAUDE_HUD_PORTRAITS`, then
+`~/.claude/portraits`, then `portraits/` beside this checkout — per file, so you can keep
+most of the set in one place and override one member from another.
+
+### 2. Crop the image
+
+The portrait is drawn in an 84×84pt rounded square, so the HUD cuts a **square** out of
+whatever you give it. Cropping it yourself first is the predictable way to control what
+ends up on screen.
+
+**Crop to these specs:**
+
+| | |
+|---|---|
+| shape | square, 1:1 |
+| size | **512×512px** recommended; **168×168px** is the practical minimum (84pt at 2× on a Retina display) |
+| framing | face centred, head filling roughly three-quarters of the frame, a little headroom above |
+| format | `.webp`, `.png`, `.jpg`, `.jpeg` or `.heic` |
+
+Do **not** round the corners, add a border, or add transparency — the HUD applies a 12pt
+corner radius and a 2.5pt coloured border itself, and anything you bake in will show
+through as a double edge.
+
+Then tell the HUD to use your square as-is, by adding one line per image to
 `~/.claude/portraits/crops.conf`:
 
 ```
-# <slug> <focus 0=top..1=bottom> <zoom >1 tightens>
-chaeyoung 0.02 1.45
+# <slug> <focus> <zoom>
+jiwon 0.5 1
 ```
 
-The slugs, and the rail colour used when a portrait is missing, come from
-`~/.claude/portraits/roster.conf` — seeded by `install.sh` and editable without a rebuild:
+Without that line the HUD assumes an uncropped photo and crops in further (see below).
+
+macOS can do this without extra tools. **Preview** is the reliable route when the face is
+not dead centre: hold <kbd>shift</kbd> to drag a square selection over the face, **Tools →
+Crop**, then **Tools → Adjust Size** to 512×512.
+
+From the terminal, `sips` squares off the photo and resizes it in two steps:
+
+```bash
+sips -c 1000 1000 source.jpg --out /tmp/square.png        # centre crop to a square
+sips -z 512 512 /tmp/square.png --out ~/.claude/portraits/jiwon.png
+```
+
+Pass your source's **shorter edge** to `-c` (1000 for a 1000×1250 photo). Note that `-c`
+crops from the centre, so on a typical head-and-shoulders portrait it lands on the torso —
+frame it in Preview first and then run only the `-z` line. `sips` reads `.webp` fine but
+will not write it; output `.png` instead.
+
+### 3. Or drop in an uncropped portrait
+
+If you would rather not crop anything, the defaults are tuned for a **4:5 portrait photo**
+— 1000×1250px is the reference shape — with the face in the upper third, which is the
+usual head-and-shoulders press or profile shot.
+
+With no `crops.conf` line, the HUD takes a square **59% of the shorter edge** (focus
+`0.30`, zoom `1.7`), horizontally centred, positioned 30% of the way down. Two things
+follow from that:
+
+- **The crop is always horizontally centred and cannot be panned.** If the face sits left
+  or right of centre, no setting will fix it — crop the image yourself as in step 2.
+- **Only 59% of the short edge survives**, so the source needs at least **300px on its
+  shorter edge** to still land above 168px.
+
+When a photo is framed differently, tune the two numbers rather than re-cropping:
+
+| | |
+|---|---|
+| `focus` | where the **centre** of the crop sits vertically: `0` = top edge, `1` = bottom edge. Lower it for a face high in the frame. Clamped so the crop never leaves the image. |
+| `zoom` | how tight the crop is. `1` uses the largest square that fits; `1.7` is the default; higher crops in further; below `1` is treated as `1`. |
+
+Check a pair by eye without waiting for a turn to end — this renders the card to a PNG
+instead of the screen:
+
+```bash
+bin/claude-hud --preview /tmp/try.png --member chaeyoung \
+  --avatar-focus 0.02 --avatar-zoom 1.45 \
+  --title "✳ crop check" --badge "session:1.1" --repo repo --branch main --body "..."
+open /tmp/try.png
+```
+
+Those two flags override `crops.conf` for that one render, so when it looks right, copy
+the numbers into the file as a `<slug> <focus> <zoom>` line.
+
+### 4. Members the HUD does not know about
+
+Slugs, display names and the rail colour used when no photo is present come from
+`~/.claude/portraits/roster.conf`, which `install.sh` seeds and you can edit without a
+rebuild:
 
 ```
 # <slug> <display name> <rail hex>
@@ -40,9 +123,12 @@ hayoung    Hayoung    8F3400
 jiwon      Jiwon      07496F
 ```
 
-Delete that file to fall back to the cast compiled into the binary. Portraits and their
-config are looked up in order: `$CLAUDE_HUD_PORTRAITS`, then `~/.claude/portraits`, then
-`portraits/` beside this checkout.
+Add a row to add a member, delete one to drop her from the rotation, change the hex to
+retune a rail. The file replaces the built-in cast entirely, so list everyone you want.
+Delete the file to fall back to the five compiled into the binary. A member with a row but
+no image file is fine — she gets the rail.
+
+To check which member a slug resolves to, render it: `--member <slug>`.
 
 ## Install
 
