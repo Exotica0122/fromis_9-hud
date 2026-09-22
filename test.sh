@@ -76,8 +76,10 @@ echo "hud binary"
 "$here/bin/claude-hud" --preview "$tmp/p.png" --title t --body b >/dev/null 2>&1
 [[ -s $tmp/p.png ]] && ok "renders a card offscreen" || bad "renders a card offscreen" "no png produced"
 if command -v swiftc >/dev/null 2>&1; then
+  # Backdate the binary rather than touching the source: /bin/bash 3.2, which CI uses,
+  # compares -nt at whole-second granularity, so a same-second touch does not read as newer.
+  touch -t 202001010000 "$here/bin/claude-hud"
   before=$(stat -f %m "$here/bin/claude-hud")
-  touch "$here/bin/claude-hud.swift"
   printf '%s' "$(payload Stop)" \
     | env -u CLAUDE_HUD_BIN CLAUDE_NOTIFY_ALWAYS=1 CLAUDE_NOTIFY_SECONDS=1 CLAUDE_NOTIFY_SOUND=none \
       "$here/notify-stop" >/dev/null 2>&1
