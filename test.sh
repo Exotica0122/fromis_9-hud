@@ -82,8 +82,16 @@ if command -v swiftc >/dev/null 2>&1; then
     | env -u CLAUDE_HUD_BIN CLAUDE_NOTIFY_ALWAYS=1 CLAUDE_NOTIFY_SECONDS=1 CLAUDE_NOTIFY_SOUND=none \
       "$here/notify-stop" >/dev/null 2>&1
   after=$(stat -f %m "$here/bin/claude-hud")
-  [[ $after -gt $before ]] && ok "rebuilds when the source is newer" \
-    || bad "rebuilds when the source is newer" "binary mtime unchanged"
+  if [[ $after -gt $before ]]; then
+    ok "rebuilds when the source is newer"
+  else
+    why=$(printf '%s' "$(payload Stop)" \
+      | env -u CLAUDE_HUD_BIN CLAUDE_NOTIFY_ALWAYS=1 CLAUDE_NOTIFY_SECONDS=1 \
+        CLAUDE_NOTIFY_SOUND=none CLAUDE_NOTIFY_DEBUG=1 "$here/notify-stop" 2>&1 >/dev/null \
+      | grep 'rebuild skipped' | head -1)
+    bad "rebuilds when the source is newer" "mtime unchanged (${why:-no reason reported}); \
+swiftc=$(command -v swiftc || echo absent) TMPDIR=${TMPDIR:-unset} src=$(stat -f %m "$here/bin/claude-hud.swift") bin=$after"
+  fi
 fi
 
 echo "paths and roster"

@@ -67,9 +67,13 @@ fi
 build_error=""
 src=$HUD.swift
 if [[ -f $src ]] && { [[ ! -x $HUD ]] || [[ $src -nt $HUD ]]; }; then
-  if command -v swiftc >/dev/null 2>&1; then
+  if ! command -v swiftc >/dev/null 2>&1; then
+    [[ ${CLAUDE_NOTIFY_DEBUG:-0} == 1 ]] && echo "notify-stop: rebuild skipped, no swiftc" >&2
+  else
     lock=${TMPDIR:-/tmp}/claude-hud-build.lock
-    if mkdir "$lock" 2>/dev/null; then
+    if ! mkdir "$lock" 2>/dev/null; then
+      [[ ${CLAUDE_NOTIFY_DEBUG:-0} == 1 ]] && echo "notify-stop: rebuild skipped, $lock held" >&2
+    else
       trap 'rm -rf "$lock" 2>/dev/null' EXIT
       if swiftc -O -o "$HUD.new" "$src" 2>"$lock/err"; then
         mv -f "$HUD.new" "$HUD"
