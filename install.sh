@@ -47,7 +47,7 @@ done
 if [[ ! -f $here/portraits/logo.svg ]]; then
   mkdir -p "$here/portraits"
   curl -fsS -m 20 -H 'User-Agent: fromis9-hud-install/1.0' \
-    'https://upload.wikimedia.org/wikipedia/commons/8/8c/Fromis_9_logo_%28ICON%29.svg' \
+    'https://upload.wikimedia.org/wikipedia/commons/8/83/Fromis_9_logo_%28ICON%29.svg' \
     -o "$here/portraits/logo.svg" \
     && say "  fetched  logo.svg (public domain — see README on trademark)" \
     || say "  skipped  logo.svg — could not reach Wikimedia; the HUD renders without it"
@@ -90,8 +90,8 @@ say "  ok       rendered ${TMPDIR:-/tmp}/fromis9-hud-smoke.png"
 
 count=0
 for dir in "$portraits" "$here/portraits"; do
-  [[ -d $dir ]] || continue
-  count=$((count + $(find "$dir" -maxdepth 1 \( -name '*.webp' -o -name '*.png' -o -name '*.jpg' -o -name '*.heic' \) \
+  [[ -d $dir ]] || continue    # -d follows the symlink stow leaves here
+  count=$((count + $(find -L "$dir" -maxdepth 1 \( -name '*.webp' -o -name '*.png' -o -name '*.jpg' -o -name '*.heic' \) \
     ! -name 'logo*' 2>/dev/null | wc -l | tr -d ' ')))
 done
 say "  info     $count portrait(s) found (0 is fine — falls back to a coloured rail)"
