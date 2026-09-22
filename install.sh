@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Build and verify fromis9-hud on a new machine.
+# Build and verify fromis_9-hud on a new machine.
 set -euo pipefail
 
-# -P resolves through symlinks: invoked via ~/.claude/fromis9-hud this would otherwise
+# -P resolves through symlinks: invoked via ~/.claude/fromis_9-hud this would otherwise
 # report the link path and we would link it to itself.
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 portraits=$HOME/.claude/portraits
@@ -46,7 +46,7 @@ done
 # trademark — fetched on request rather than committed, and the HUD renders without it.
 if [[ ! -f $here/portraits/logo.svg ]]; then
   mkdir -p "$here/portraits"
-  curl -fsS -m 20 -H 'User-Agent: fromis9-hud-install/1.0' \
+  curl -fsS -m 20 -H 'User-Agent: fromis_9-hud-install/1.0' \
     'https://upload.wikimedia.org/wikipedia/commons/8/83/Fromis_9_logo_%28ICON%29.svg' \
     -o "$here/portraits/logo.svg" \
     && say "  fetched  logo.svg (public domain — see README on trademark)" \
@@ -80,13 +80,13 @@ link() {                       # link <target> <link-path>
   mkdir -p "$(dirname "$link")"
   ln -s "$target" "$link" && say "  linked   $(basename "$link") → $target"
 }
-link "$here" "$HOME/.claude/fromis9-hud"
+link "$here" "$HOME/.claude/fromis_9-hud"
 
 say "smoke test"
-"$here/bin/claude-hud" --preview "${TMPDIR:-/tmp}/fromis9-hud-smoke.png" \
+"$here/bin/claude-hud" --preview "${TMPDIR:-/tmp}/fromis_9-hud-smoke.png" \
   --title "install check" --badge "session:1.1" --repo repo --branch main \
   --body "If you can read this, the build works." >/dev/null
-say "  ok       rendered ${TMPDIR:-/tmp}/fromis9-hud-smoke.png"
+say "  ok       rendered ${TMPDIR:-/tmp}/fromis_9-hud-smoke.png"
 
 count=0
 for dir in "$portraits" "$here/portraits"; do
@@ -97,7 +97,7 @@ done
 say "  info     $count portrait(s) found (0 is fine — falls back to a coloured rail)"
 
 settings=$HOME/.claude/settings.json
-if [[ -f $settings ]] && grep -q 'fromis9-hud/notify-stop' "$settings" 2>/dev/null; then
+if [[ -f $settings ]] && grep -q 'fromis_9-hud/notify-stop' "$settings" 2>/dev/null; then
   say "  ok       hooks already registered in settings.json"
 else
   cat <<SNIPPET

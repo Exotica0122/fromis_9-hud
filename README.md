@@ -1,4 +1,4 @@
-# fromis9-hud
+# fromis_9-hud
 
 A HUD that appears top-centre when a Claude Code turn finishes: session name, tmux pane
 address, repo, branch, and a snippet of the last reply, over a pink fromis_9 theme with a
@@ -133,17 +133,17 @@ To check which member a slug resolves to, render it: `--member <slug>`.
 ## Install
 
 ```bash
-git clone https://github.com/Exotica0122/fromis9-hud
-cd fromis9-hud && ./install.sh
+git clone https://github.com/Exotica0122/fromis_9-hud
+cd fromis_9-hud && ./install.sh
 ```
 
 It checks dependencies, compiles the Swift binary, seeds `~/.claude/portraits`, links the
-checkout at `~/.claude/fromis9-hud`, and runs a smoke test. It does **not** edit your
+checkout at `~/.claude/fromis_9-hud`, and runs a smoke test. It does **not** edit your
 `settings.json` — it prints `hooks.example.json` for you to merge:
 
 ```json
 "Stop": [{ "hooks": [{ "type": "command",
-  "command": "~/.claude/fromis9-hud/notify-stop", "timeout": 10, "async": true }] }]
+  "command": "~/.claude/fromis_9-hud/notify-stop", "timeout": 10, "async": true }] }]
 ```
 
 The compiled binary is deliberately not committed — it is architecture-specific and
