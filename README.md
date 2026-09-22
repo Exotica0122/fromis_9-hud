@@ -4,18 +4,27 @@ A HUD that appears top-centre when a Claude Code turn finishes: session name, tm
 address, repo, branch, and a snippet of the last reply, over a pink fromis_9 theme with a
 member portrait. Clicking it jumps to the tmux pane that fired it.
 
+![A pink HUD card: the turn title, the tmux pane address, repo and branch, the last line of the reply, and a portrait on the left](docs/hud.png)
+
 Notifications stack rather than overlap — collapsed, only the newest is readable with the
 rest peeking beneath; hovering fans them out and holds every clock until the pointer
 leaves. A session that is *blocked* rather than finished looks structurally different: no
 portrait, a deep-red rail and its own glyph, so it cannot be misread as "done".
 
-macOS only — the HUD is AppKit.
+![Three HUD cards fanned out vertically, each with its own portrait, pane address and message](docs/hud-stack.png)
+
+macOS only — the HUD is AppKit. **Portraits in these screenshots are generated
+placeholders** — the repository ships no photos, as below.
 
 ## Portraits are not included
 
 **This repository ships no member photos.** They are third-party images and not mine to
 redistribute. Without them the HUD falls back to a coloured rail per member and works
 exactly the same — adding them is optional.
+
+![The same HUD card with no portrait, showing a narrow coloured rail in its place](docs/hud-rail.png)
+
+*What a fresh clone looks like: no portraits, each member keeping her own rail colour.*
 
 ### 1. Put the file where the HUD looks
 
@@ -188,7 +197,7 @@ attached session, the terminal is frontmost, and the screen is not locked. Set
 | `hooks.example.json` | the snippet to merge into `settings.json` |
 | `portraits.example/` | `roster.conf` and `crops.conf` templates — no images |
 | `install.sh` | dependency check, build, symlink |
-| `test.sh` | smoke test — 18 assertions, no windows drawn |
+| `test.sh` | smoke test, no windows drawn; tmux-dependent checks skip themselves |
 
 ## Blocked notifications
 

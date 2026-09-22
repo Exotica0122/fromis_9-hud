@@ -26,11 +26,17 @@ let portraitDirs: [URL] = {
     return dirs
 }()
 
-func portraitFile(_ name: String) -> URL? {
+func portraitFile(_ name: String) -> URL? { portraitFile(anyOf: [name]) }
+
+/// Directory order outranks the order of `names`: a higher-priority directory wins even
+/// when a lower one holds the more-preferred extension.
+func portraitFile(anyOf names: [String]) -> URL? {
     let fm = FileManager.default
     for dir in portraitDirs {
-        let url = dir.appendingPathComponent(name)
-        if fm.fileExists(atPath: url.path) { return url }
+        for name in names {
+            let url = dir.appendingPathComponent(name)
+            if fm.fileExists(atPath: url.path) { return url }
+        }
     }
     return nil
 }
@@ -202,9 +208,8 @@ func resolveAvatar(_ explicit: String, slug: String) -> NSImage? {
         let path = (explicit as NSString).expandingTildeInPath
         if fm.fileExists(atPath: path) { return NSImage(contentsOfFile: path) }
     }
-    for ext in ["webp", "png", "jpg", "jpeg", "heic"] {
-        if let url = portraitFile("\(slug).\(ext)") { return NSImage(contentsOf: url) }
-    }
+    let names = ["webp", "png", "jpg", "jpeg", "heic"].map { "\(slug).\($0)" }
+    if let url = portraitFile(anyOf: names) { return NSImage(contentsOf: url) }
     return nil
 }
 
@@ -316,8 +321,8 @@ func buildCard(_ opts: Options, flat: Bool) -> Card {
             let path = (opts.logo as NSString).expandingTildeInPath
             return fm.fileExists(atPath: path) ? NSImage(contentsOfFile: path) : nil
         }
-        for name in ["logo.svg", "logo.pdf", "logo.png"] {
-            if let url = portraitFile(name) { return NSImage(contentsOf: url) }
+        if let url = portraitFile(anyOf: ["logo.svg", "logo.pdf", "logo.png"]) {
+            return NSImage(contentsOf: url)
         }
         return nil
     }()

@@ -120,5 +120,33 @@ else
   bad "roster.conf recolours the rail" "a preview failed to render"
 fi
 
+echo "portrait lookup"
+# Two distinct, definitely-valid images, rendered by the HUD itself.
+# They must differ in the middle of the frame: the avatar crop is centred, so images
+# differing only at an edge (an accent rail, say) survive the crop looking identical.
+"$here/bin/claude-hud" --preview "$tmp/A.png" --avatar none --sound none \
+  --title "XXXXXXXXXXXXXXXXXXXX" --body "$(printf 'X%.0s' {1..120})" >/dev/null 2>&1
+"$here/bin/claude-hud" --preview "$tmp/B.png" --avatar none --sound none \
+  --title "oooooooooooooooooooo" --body "$(printf 'o%.0s' {1..120})" >/dev/null 2>&1
+pri=$tmp/primary; mkdir -p "$pri" "$here/portraits"
+printf 'solo Solo One 00FF00\n' >"$pri/roster.conf"
+cp "$tmp/A.png" "$pri/solo.png"
+# .webp by name, PNG by content — NSImage sniffs the bytes, and the point here is that a
+# lower-priority directory holds the extension the lookup would otherwise prefer.
+cp "$tmp/B.png" "$here/portraits/solo.webp"
+shot() { CLAUDE_HUD_PORTRAITS=$pri "$here/bin/claude-hud" --preview "$1" --member solo \
+  --sound none --title t --body b >/dev/null 2>&1; }
+shot "$tmp/both.png"
+rm -f "$here/portraits/solo.webp"
+shot "$tmp/alone.png"
+if [[ -s $tmp/both.png && -s $tmp/alone.png ]]; then
+  cmp -s "$tmp/both.png" "$tmp/alone.png" \
+    && ok "a higher-priority directory beats a preferred extension below it" \
+    || bad "a higher-priority directory beats a preferred extension below it" \
+           "the checkout's .webp won over \$CLAUDE_HUD_PORTRAITS/.png"
+else
+  bad "a higher-priority directory beats a preferred extension below it" "a preview failed"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ $fail -eq 0 ]]
