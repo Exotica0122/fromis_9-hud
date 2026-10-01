@@ -8,7 +8,16 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 
 # Overridable so the test suite can point at a stub and assert on the arguments
 # instead of flashing real windows.
-HUD=${CLAUDE_HUD_BIN:-$here/bin/claude-hud}
+case $(uname) in
+  Darwin) os=mac ;;
+  Linux)  os=linux ;;
+  *)      os=other ;;
+esac
+# The macOS HUD is AppKit and the Linux one is GTK4 on a layer-shell surface; they
+# take the same flags, so everything below this line is platform-neutral.
+default_hud=$here/bin/claude-hud
+[[ $os == linux ]] && default_hud=$here/bin/claude-hud-gtk
+HUD=${CLAUDE_HUD_BIN:-$default_hud}
 SECONDS_SHOWN=${CLAUDE_NOTIFY_SECONDS:-5}
 SOUND=${CLAUDE_NOTIFY_SOUND:-Glass}
 VOLUME=${CLAUDE_NOTIFY_VOLUME:-1.0}
@@ -50,11 +59,31 @@ if [[ ${CLAUDE_NOTIFY_ALWAYS:-0} != 1 && -n ${TMUX_PANE:-} ]]; then
     '#{pane_active} #{window_active} #{session_attached}' 2>/dev/null)
   set -- $onscreen
   if [[ ${1:-0} == 1 && ${2:-0} == 1 && ${3:-0} -ge 1 ]]; then
-    front=$(lsappinfo info -only name "$(lsappinfo front 2>/dev/null)" 2>/dev/null \
-      | sed -E 's/.*"LSDisplayName"="([^"]*)".*/\1/')
-    locked=$(ioreg -n Root -d1 -k CGSSessionScreenIsLocked 2>/dev/null \
-      | grep -c '"CGSSessionScreenIsLocked" = Yes')
-    if [[ $front == "${CLAUDE_TERMINAL_APP:-Ghostty}" && ${locked:-0} == 0 ]]; then
+    if [[ $os == mac ]]; then
+      front=$(lsappinfo info -only name "$(lsappinfo front 2>/dev/null)" 2>/dev/null \
+        | sed -E 's/.*"LSDisplayName"="([^"]*)".*/\1/')
+      locked=$(ioreg -n Root -d1 -k CGSSessionScreenIsLocked 2>/dev/null \
+        | grep -c '"CGSSessionScreenIsLocked" = Yes')
+      terminal=${CLAUDE_TERMINAL_APP:-Ghostty}
+    else
+      # The Wayland equivalents: the focused toplevel's app id, and whether a
+      # screen locker holds the session. Both are best-effort — an unknown
+      # compositor leaves front empty, which just means the HUD always shows.
+      if command -v hyprctl >/dev/null 2>&1; then
+        front=$("$JQ" -r '.class // empty' <<<"$(hyprctl activewindow -j 2>/dev/null)" 2>/dev/null)
+      elif command -v swaymsg >/dev/null 2>&1; then
+        front=$(swaymsg -t get_tree 2>/dev/null \
+          | "$JQ" -r '.. | select(.focused? == true) | .app_id // .window_properties.class // empty' 2>/dev/null | head -1)
+      else
+        front=""
+      fi
+      locked=0
+      pgrep -x hyprlock >/dev/null 2>&1 && locked=1
+      pgrep -x swaylock >/dev/null 2>&1 && locked=1
+      [[ $(loginctl show-session "${XDG_SESSION_ID:-}" -p LockedHint --value 2>/dev/null) == yes ]] && locked=1
+      terminal=${CLAUDE_TERMINAL_APP:-com.mitchellh.ghostty}
+    fi
+    if [[ -n $front && $front == "$terminal" && ${locked:-0} == 0 ]]; then
       [[ ${CLAUDE_NOTIFY_DEBUG:-0} == 1 ]] && echo "notify-stop: skipped, you are watching this pane" >&2
       exit 0
     fi
@@ -64,9 +93,10 @@ fi
 # A git pull can bring a newer source than the compiled binary, and nothing else
 # would notice. Rebuild into a temp file and swap only on success, so a broken
 # source never destroys a working binary. The lock stops sixteen panes racing.
+# The Linux backend is a script: nothing to compile, and it is never stale.
 build_error=""
 src=$HUD.swift
-if [[ -f $src ]] && { [[ ! -x $HUD ]] || [[ $src -nt $HUD ]]; }; then
+if [[ $os == mac && -f $src ]] && { [[ ! -x $HUD ]] || [[ $src -nt $HUD ]]; }; then
   if ! command -v swiftc >/dev/null 2>&1; then
     [[ ${CLAUDE_NOTIFY_DEBUG:-0} == 1 ]] && echo "notify-stop: rebuild skipped, no swiftc" >&2
   else
@@ -146,14 +176,35 @@ if [[ ${CLAUDE_NOTIFY_NATIVE:-1} == 1 ]]; then
     banner="Finished${badge:+ — open $badge}"
   fi
   [[ ${CLAUDE_NOTIFY_DEBUG:-0} == 1 ]] && echo "notify-stop: banner=[$banner]" >&2
-  if [[ -n $NOTIFIER ]]; then
+  if [[ $os == linux ]] && command -v notify-send >/dev/null 2>&1; then
+    # x-canonical-private-synchronous is the freedesktop counterpart of
+    # terminal-notifier's -group: a second banner for the same pane replaces the
+    # first instead of stacking another copy in the tray.
+    args=(-a "Claude Code"
+          -u "$([[ $event == Notification ]] && echo critical || echo normal)"
+          -h "string:x-canonical-private-synchronous:$group"
+          -h "string:desktop-entry:claude-code")
+    [[ -n ${CLAUDE_NOTIFY_ICON:-} ]] && args+=(-i "$CLAUDE_NOTIFY_ICON")
+    if [[ -n ${TMUX_PANE:-} ]]; then
+      # --wait blocks for the life of the banner and then prints the key of
+      # whatever was pressed, so the whole thing is detached and acts afterwards.
+      (
+        chosen=$(notify-send "${args[@]}" -A "focus=Open ${badge:-$repo}" --wait \
+                   "$glyph ${title:-$repo}" "$subtitle"$'\n'"$banner" 2>/dev/null)
+        [[ $chosen == focus ]] && "$here/focus-pane" "$TMUX_PANE" "$group"
+      ) >/dev/null 2>&1 &
+    else
+      notify-send "${args[@]}" "$glyph ${title:-$repo}" "$subtitle"$'\n'"$banner" \
+        >/dev/null 2>&1 &
+    fi
+  elif [[ -n $NOTIFIER ]]; then
     # terminal-notifier can run a command on click; osascript cannot.
     args=(-title "$glyph ${title:-$repo}" -subtitle "$subtitle" -message "$banner"
           -group "$group")
     [[ -n ${TMUX_PANE:-} ]] && args+=(-execute "$here/focus-pane $TMUX_PANE $group")
     [[ -n ${CLAUDE_NOTIFY_NATIVE_SOUND:-} ]] && args+=(-sound "$CLAUDE_NOTIFY_NATIVE_SOUND")
     "$NOTIFIER" "${args[@]}" >/dev/null 2>&1 &
-  else
+  elif [[ $os == mac ]]; then
     /usr/bin/osascript - "$glyph ${title:-$repo}" "$subtitle" "$banner" >/dev/null 2>&1 <<'APPLESCRIPT' &
 on run argv
   display notification (item 3 of argv) with title (item 1 of argv) subtitle (item 2 of argv)

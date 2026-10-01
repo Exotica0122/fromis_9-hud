@@ -2,8 +2,9 @@
 # Bring a tmux pane to the front, and clear whatever announced it.
 # Usage: focus-pane <pane-id> [notification-group]
 set -uo pipefail
-# terminal-notifier's -execute runs with a bare system PATH, so tmux would not resolve.
-PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
+# terminal-notifier's -execute (and a notification daemon's action callback) run with
+# a bare system PATH, so tmux would not resolve.
+PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH
 pane=${1:-}
 group=${2:-}
 [[ -n $pane ]] || exit 0
@@ -26,14 +27,29 @@ fi
 tmux select-window -t "$target" 2>/dev/null
 tmux select-pane -t "$pane" 2>/dev/null
 
-app=${CLAUDE_TERMINAL_APP:-Ghostty}
-/usr/bin/osascript -e "tell application \"$app\" to activate" >/dev/null 2>&1
+# Raise the terminal itself: selecting the pane does nothing if the window it is in
+# is behind something else, or on another workspace.
+if [[ $(uname) == Darwin ]]; then
+  app=${CLAUDE_TERMINAL_APP:-Ghostty}
+  /usr/bin/osascript -e "tell application \"$app\" to activate" >/dev/null 2>&1
+else
+  app=${CLAUDE_TERMINAL_APP:-com.mitchellh.ghostty}
+  if command -v hyprctl >/dev/null 2>&1; then
+    hyprctl dispatch focuswindow "class:^${app}$" >/dev/null 2>&1
+  elif command -v swaymsg >/dev/null 2>&1; then
+    swaymsg "[app_id=\"$app\"] focus" >/dev/null 2>&1
+  fi
+fi
 
-# Acting on one surface retires the other: clicking the HUD drops the banner from
-# Notification Center, and clicking the banner closes the HUD still on screen.
+# Acting on one surface retires the other: clicking the HUD drops the banner, and
+# pressing the banner's button closes the HUD still on screen.
 if [[ -n $group ]] && command -v terminal-notifier >/dev/null 2>&1; then
   terminal-notifier -remove "$group" >/dev/null 2>&1
 fi
-pkill -f "claude-hud.*focus-pane $pane" >/dev/null 2>&1
+# macOS only: there, each notification is its own claude-hud process holding the
+# --on-click string. The Linux backend is one daemon owning every card, and it
+# dismisses the clicked card itself, so matching on the command line would kill
+# the daemon and every other card with it.
+[[ $(uname) == Darwin ]] && pkill -f "claude-hud.*focus-pane $pane" >/dev/null 2>&1
 
 exit 0
