@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  test:
+  macos:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,6 +18,29 @@ jobs:
 
       - name: build
         run: swiftc -O -o bin/claude-hud bin/claude-hud.swift
+
+      - name: test
+        run: ./test.sh
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No compositor here, and none is needed: --preview renders straight to a PNG
+      # and never opens a surface, so gtk4-layer-shell is not part of this job.
+      - name: install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            jq tmux python3-gi python3-gi-cairo python3-cairo \
+            gir1.2-gtk-4.0 gir1.2-gdkpixbuf-2.0 gir1.2-pango-1.0
+
+      - name: syntax
+        run: python3 -c "import ast; ast.parse(open('bin/claude-hud-gtk').read())"
+
+      - name: render a card offscreen
+        run: ./bin/claude-hud-gtk --preview /tmp/ci.png --title t --repo r --body b
 
       - name: test
         run: ./test.sh

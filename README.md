@@ -13,8 +13,11 @@ portrait, a deep-red rail and its own glyph, so it cannot be misread as "done".
 
 ![Three HUD cards fanned out vertically, each with its own portrait, pane address and message](docs/hud-stack.png)
 
-macOS only — the HUD is AppKit. The screenshots show a configured install; the portraits
-in them are not part of this repository, as below.
+Two backends, one card. On macOS the HUD is AppKit (`bin/claude-hud.swift`); on Linux it
+is GTK4 drawn on a Wayland `zwlr_layer_shell_v1` surface (`bin/claude-hud-gtk`). They take
+the same flags and `notify-stop` picks one by `uname`, so everything below applies to both
+unless it says otherwise. The screenshots show a configured install; the portraits in them
+are not part of this repository, as below.
 
 ## Portraits are not included
 
@@ -70,9 +73,9 @@ jiwon 0.5 1
 
 Without that line the HUD assumes an uncropped photo and crops in further (see below).
 
-macOS can do this without extra tools. **Preview** is the reliable route when the face is
-not dead centre: hold <kbd>shift</kbd> to drag a square selection over the face, **Tools →
-Crop**, then **Tools → Adjust Size** to 512×512.
+**macOS** can do this without extra tools. **Preview** is the reliable route when the face
+is not dead centre: hold <kbd>shift</kbd> to drag a square selection over the face,
+**Tools → Crop**, then **Tools → Adjust Size** to 512×512.
 
 From the terminal, `sips` squares off the photo and resizes it in two steps:
 
@@ -85,6 +88,17 @@ Pass your source's **shorter edge** to `-c` (1000 for a 1000×1250 photo). Note 
 crops from the centre, so on a typical head-and-shoulders portrait it lands on the torso —
 frame it in Preview first and then run only the `-z` line. `sips` reads `.webp` fine but
 will not write it; output `.png` instead.
+
+**Linux**, with ImageMagick — `-gravity north` is the difference that matters, since it
+keeps the face instead of centring on the torso:
+
+```bash
+magick source.jpg -gravity north -crop 1000x1000+0+0 +repage -resize 512x512 \
+  ~/.claude/portraits/jiwon.png
+```
+
+GIMP works as well: **Tools → Transform Tools → Crop** with a fixed 1:1 aspect, then
+**Image → Scale Image** to 512×512.
 
 ### 3. Or drop in an uncropped portrait
 
@@ -112,10 +126,11 @@ Check a pair by eye without waiting for a turn to end — this renders the card 
 instead of the screen:
 
 ```bash
+# bin/claude-hud-gtk on Linux; same flags
 bin/claude-hud --preview /tmp/try.png --member chaeyoung \
   --avatar-focus 0.02 --avatar-zoom 1.45 \
   --title "✳ crop check" --badge "session:1.1" --repo repo --branch main --body "..."
-open /tmp/try.png
+open /tmp/try.png        # xdg-open on Linux
 ```
 
 Those two flags override `crops.conf` for that one render, so when it looks right, copy
@@ -147,59 +162,99 @@ git clone https://github.com/Exotica0122/fromis_9-hud
 cd fromis_9-hud && ./install.sh
 ```
 
-It checks dependencies, compiles the Swift binary, seeds `~/.claude/portraits`, links the
-checkout at `~/.claude/fromis_9-hud`, and runs a smoke test. It does **not** edit your
-`settings.json` — it prints `hooks.example.json` for you to merge:
+It checks the dependencies for your platform, builds the backend that needs building,
+seeds `~/.claude/portraits`, links the checkout at `~/.claude/fromis_9-hud`, and runs a
+smoke test. It does **not** edit your `settings.json` — it prints `hooks.example.json` for
+you to merge:
 
 ```json
 "Stop": [{ "hooks": [{ "type": "command",
   "command": "~/.claude/fromis_9-hud/notify-stop", "timeout": 10, "async": true }] }]
 ```
 
-The compiled binary is deliberately not committed — it is architecture-specific and
-rebuilds in about a second. `notify-stop` also rebuilds it automatically when the source
-is newer, swapping it in only on a successful compile.
+On macOS the compiled binary is deliberately not committed — it is architecture-specific
+and rebuilds in about a second, and `notify-stop` rebuilds it automatically when the
+source is newer, swapping it in only on a successful compile. The Linux backend is a
+script, so there is nothing to build and nothing to go stale.
 
 Run `./test.sh` after a pull or on a new machine; CI runs it on every push and pull
-request against a macOS runner. Assertions that need a live tmux pane skip themselves
-when there is none, so the suite is green both in CI and in a terminal. It points the hook at a stub via
-`CLAUDE_HUD_BIN` and asserts on the arguments, so nothing is drawn on screen, and it
-exits non-zero on failure.
+request, on a macOS runner and a Linux one. Assertions that need a live tmux pane, or an
+attached session, skip themselves when there is none, so the suite is green both in CI
+and in a terminal. It points the hook at a stub via `CLAUDE_HUD_BIN` and asserts on the
+arguments, so nothing is drawn on screen, and it exits non-zero on failure.
 
 ## Dependencies
 
+Both platforms:
+
 | Dependency | Required? |
 |---|---|
-| macOS | required — the HUD is AppKit |
-| `swiftc` | required — `xcode-select --install` |
 | `jq` | required — reads the hook payload and transcript |
 | `tmux` | optional — without it there is no pane address and no click-to-focus |
+
+macOS:
+
+| Dependency | Required? |
+|---|---|
+| `swiftc` | required — `xcode-select --install` |
 | `terminal-notifier` | optional — makes the Notification Center banner clickable |
+
+Linux:
+
+| Dependency | Required? |
+|---|---|
+| a Wayland compositor with `zwlr_layer_shell_v1` | required — Hyprland, sway, river, niri and the wlroots family all have it; GNOME does not |
+| `gtk4`, `gtk4-layer-shell` | required |
+| `python3` with PyGObject and pycairo | required |
+| `hyprctl` / `swaymsg` | optional — without one, the HUD cannot tell that you are already looking at the pane, and always shows |
+| `notify-send` | optional — the persistent banner, through your notification daemon |
+
+```bash
+# Arch
+sudo pacman -S gtk4 gtk4-layer-shell python-gobject python-cairo jq tmux libnotify
+# Fedora
+sudo dnf install gtk4 gtk4-layer-shell python3-gobject python3-cairo jq tmux libnotify
+# Debian / Ubuntu
+sudo apt install libgtk-4-1 libgtk4-layer-shell0 python3-gi python3-cairo jq tmux libnotify-bin
+```
+
+X11 is not supported: the HUD is a layer-shell surface, and layer shell is a Wayland
+protocol. There is no override-redirect fallback.
 
 ## How it runs
 
 One daemon owns the panel and renders every notification; the hook is a client that posts
-its arguments over a Unix socket in `TMPDIR` and exits immediately. The daemon starts on
+its arguments over a Unix socket — in `TMPDIR` on macOS, `XDG_RUNTIME_DIR` on Linux — and
+exits immediately. The daemon starts on
 the first notification and exits after 45 seconds with nothing to show. If it cannot be
 reached the hook falls back to `--solo`, a standalone one-shot stack, so a wedged daemon
 never costs a notification.
 
 The hook stays silent when you are already looking at the pane — it is on screen in an
-attached session, the terminal is frontmost, and the screen is not locked. Set
-`CLAUDE_NOTIFY_ALWAYS=1` to notify regardless.
+attached session, the terminal is frontmost, and the screen is not locked. "Frontmost" is
+`lsappinfo` on macOS and `hyprctl activewindow` or `swaymsg -t get_tree` on Linux;
+"locked" is the `CGSSessionScreenIsLocked` key on macOS and a running `hyprlock`/`swaylock`
+or `loginctl`'s `LockedHint` on Linux. Set `CLAUDE_NOTIFY_ALWAYS=1` to notify regardless.
+
+On Linux, `gtk4-layer-shell` has to interpose `libwayland-client` before GTK opens the
+display, which a Python process cannot arrange after import. `claude-hud-gtk` therefore
+re-execs itself once with `LD_PRELOAD` set — it finds the library itself, so there is
+nothing to configure, but it is why the process list shows `python3` rather than the
+script's name.
 
 ## Files
 
 | File | Purpose |
 |---|---|
 | `notify-stop` | the Stop/Notification hook: builds the notification from the transcript |
-| `bin/claude-hud.swift` | the HUD, the only real source file |
+| `bin/claude-hud.swift` | the macOS HUD (AppKit) |
+| `bin/claude-hud-gtk` | the Linux HUD (GTK4 on a layer-shell surface) |
 | `focus-pane` | jumps to a tmux pane and raises the terminal |
 | `hooks.example.json` | the snippet to merge into `settings.json` |
 | `portraits.example/` | `roster.conf` and `crops.conf` templates — no images |
 | `install.sh` | dependency check, build, symlink |
 | `test.sh` | smoke test, no windows drawn; tmux-dependent checks skip themselves |
-| `.github/workflows/ci.yml` | builds and runs the suite on a macOS runner |
+| `.github/workflows/ci.yml` | builds and runs the suite on a macOS runner and a Linux one |
 
 ## Blocked notifications
 
@@ -217,15 +272,24 @@ field name — it is off by default because a payload can quote a command.
 ## Tuning
 
 ```bash
-CLAUDE_NOTIFY_SOUND=Hero      # system sound name, a file in ~/.claude/sounds, a path, or none
+CLAUDE_NOTIFY_SOUND=Hero      # sound name, a file in ~/.claude/sounds, a path, or none
 CLAUDE_NOTIFY_VOLUME=0.6      # 0.0 to 1.0
 CLAUDE_NOTIFY_SECONDS=8       # how long the HUD holds
 CLAUDE_NOTIFY_MEMBER=jiwon    # pin a member instead of picking at random
 CLAUDE_NOTIFY_ACCENT='#f59e0b'
-CLAUDE_NOTIFY_NATIVE=0        # skip the Notification Center banner
+CLAUDE_NOTIFY_NATIVE=0        # skip the persistent banner
 CLAUDE_TERMINAL_APP=Ghostty   # which app focus-pane raises
 CLAUDE_HUD_PORTRAITS=~/pics   # where portraits and their config live
 ```
+
+`CLAUDE_TERMINAL_APP` is an application name on macOS (`Ghostty`) and a window class on
+Linux (`com.mitchellh.ghostty`, the default there) — `hyprctl clients -j | jq -r .[].class`
+lists yours.
+
+Sound names are macOS system sounds (`Glass`, `Funk`, `Hero`). On Linux the common ones
+map onto freedesktop sound-theme ids — `Glass` to `message`, `Funk` to `dialog-warning` —
+and anything else is passed through as an id, so `CLAUDE_NOTIFY_SOUND=complete` works
+directly. A path or a file in `~/.claude/sounds` is used verbatim on both.
 
 The Notification Center banner carries no message text. The HUD is transient and already
 on your screen, but Notification Center keeps a history, and a turn that discussed a token
@@ -254,12 +318,22 @@ get different members, since the seed is the full address rather than the sessio
 | `random` | a different member every notification |
 | `<slug>` | always that member |
 
-## Notification Center
+## The persistent banner
 
-`notify-stop` also posts a native banner via `terminal-notifier`, falling back to
-`osascript`. This is best-effort: macOS refuses notification authorisation to ad-hoc
-signed binaries and to processes spawned from a long-running tmux server, so on some
-machines nothing appears. The HUD does not depend on it.
+The HUD is gone in seconds; a desktop notification survives in history for when you come
+back. `notify-stop` posts one alongside the HUD, silently, so the chime is not doubled.
+
+On macOS that is `terminal-notifier`, falling back to `osascript`. This is best-effort:
+macOS refuses notification authorisation to ad-hoc signed binaries and to processes
+spawned from a long-running tmux server, so on some machines nothing appears.
+
+On Linux it is `notify-send`, which reaches whatever daemon you run (mako, dunst,
+swaync). The banner carries a button that jumps to the pane, and sets
+`x-canonical-private-synchronous` so a second notification for the same pane replaces the
+first instead of stacking another copy in the tray. Clicking the button runs the same
+`focus-pane` the HUD does.
+
+Neither backend depends on it — set `CLAUDE_NOTIFY_NATIVE=0` to skip it entirely.
 
 ## tmux pane labels
 
