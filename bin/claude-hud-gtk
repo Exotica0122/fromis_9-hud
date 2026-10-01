@@ -1,0 +1,1125 @@
+#!/usr/bin/env python3
+"""Linux backend for the fromis_9 HUD: the same card claude-hud.swift draws, on a
+Wayland layer-shell surface.
+
+AppKit has no Linux counterpart, so the card is drawn with Cairo and Pango and the
+one drawing routine serves both the live surface and --preview. Everything outside
+the drawing — the flags, the roster and crops.conf formats, the member rotation, the
+stack geometry, the socket protocol — matches the Swift binary, so notify-stop can
+hand either one the same argv.
+"""
+import json
+import math
+import os
+import socket
+import subprocess
+import sys
+import time
+import warnings
+
+
+
+def _preload_layer_shell():
+    """gtk4-layer-shell has to interpose libwayland-client before GTK opens the
+    display, which a Python process cannot arrange after the fact — gtk4_layer_shell
+    then reports the protocol as unsupported on a compositor that does support it.
+    Re-exec once with LD_PRELOAD set. --preview never opens a surface, so it skips
+    this and stays usable without a compositor at all."""
+    if os.environ.get("CLAUDE_HUD_PRELOADED") or "--preview" in sys.argv:
+        return
+    import ctypes.util
+    name = ctypes.util.find_library("gtk4-layer-shell")
+    candidates = [name] if name else []
+    candidates += ["/usr/lib/libgtk4-layer-shell.so.0", "/usr/lib/libgtk4-layer-shell.so",
+                   "/usr/lib64/libgtk4-layer-shell.so.0", "/usr/local/lib/libgtk4-layer-shell.so.0"]
+    lib = next((c for c in candidates if c and (os.path.exists(c) or "/" not in c)), None)
+    if not lib:
+        return
+    env = dict(os.environ)
+    existing = env.get("LD_PRELOAD", "")
+    env["LD_PRELOAD"] = f"{lib}:{existing}" if existing else lib
+    env["CLAUDE_HUD_PRELOADED"] = "1"
+    try:
+        os.execve(sys.executable, [sys.executable, os.path.realpath(__file__)] + sys.argv[1:], env)
+    except OSError:
+        pass
+
+
+_preload_layer_shell()
+
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+gi.require_version("GdkPixbuf", "2.0")
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango, PangoCairo  # noqa: E402
+
+# GTK4 moved rendering to GSK and deprecated every Cairo bridge with it, replacing
+# none of them. This card is drawn in Cairo so that one routine can serve both the
+# live surface and --preview, which leaves gdk_cairo_set_source_pixbuf as the only
+# way in. It still works and costs 4ms for a 1000x1250 portrait; the warning is the
+# only thing wrong with it, and it would otherwise land in the hook's stderr.
+warnings.filterwarnings("ignore", "Gdk.cairo_set_source_pixbuf is deprecated")
+
+import cairo  # noqa: E402
+
+# fromis_9 theme: a light pink surface with dark plum ink. A dark panel could not be
+# read as pink without pushing the text below AA, so the polarity is flipped instead.
+BASE_TOP = (1.000, 0.878, 0.933)      # #FFE0EE
+BASE_BOTTOM = (1.000, 0.749, 0.855)   # #FFBFDA
+BASE_ALPHA = 0.97
+EDGE = (0.898, 0.561, 0.714)          # #E58FB6
+INK = (0.239, 0.055, 0.141)           # #3D0E24
+INK_BODY = (0.353, 0.137, 0.251)      # #5A2340
+INK_META = (0.420, 0.165, 0.278)      # #6B2A47
+INK_FAINT = (0.541, 0.314, 0.439)     # #8A5070
+LOGO_TINT = (0.690, 0.165, 0.384)     # #B02A62
+
+CARD_W = 528.0
+CARD_PAD = 16.0
+CARD_CORNER = 17.0
+RAIL_W = 3.5
+GAP = 10.0
+PEEK_STEP = 7.0
+MAX_PEEKS = 2
+TOP_MARGIN = 24
+
+DEFAULT_MEMBERS = [
+    ("hayoung", "Hayoung", (143, 52, 0)),
+    ("jiwon", "Jiwon", (7, 73, 111)),
+    ("chaeyoung", "Chaeyoung", (107, 72, 0)),
+    ("nagyung", "Nagyung", (145, 0, 47)),
+    ("jiheon", "Jiheon", (35, 52, 140)),
+]
+
+HOME = os.path.expanduser("~")
+
+
+def rgb(r, g, b):
+    return (r / 255.0, g / 255.0, b / 255.0)
+
+
+def parse_hex(s):
+    s = s[1:] if s.startswith("#") else s
+    if len(s) != 6:
+        return None
+    try:
+        v = int(s, 16)
+    except ValueError:
+        return None
+    return rgb((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF)
+
+
+# ---------------------------------------------------------------- portraits
+
+def portrait_dirs():
+    """$CLAUDE_HUD_PORTRAITS, ~/.claude/portraits, then portraits/ beside the checkout."""
+    dirs = []
+    env = os.environ.get("CLAUDE_HUD_PORTRAITS", "")
+    if env:
+        dirs.append(os.path.expanduser(env))
+    dirs.append(os.path.join(HOME, ".claude/portraits"))
+    here = os.path.dirname(os.path.realpath(__file__))
+    dirs.append(os.path.join(os.path.dirname(here), "portraits"))
+    return dirs
+
+
+def portrait_file(*names):
+    """Directory order outranks name order: a higher-priority directory wins even when
+    a lower one holds the more-preferred extension."""
+    for d in portrait_dirs():
+        for name in names:
+            p = os.path.join(d, name)
+            if os.path.exists(p):
+                return p
+    return None
+
+
+def read_conf(name):
+    path = portrait_file(name)
+    if not path:
+        return []
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return []
+    rows = []
+    for raw in text.split("\n"):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        rows.append(line.split())
+    return rows
+
+
+def load_roster():
+    """"<slug> <display name> <rail hex>" lines; the name may contain spaces."""
+    out = []
+    for parts in read_conf("roster.conf"):
+        if len(parts) < 3:
+            continue
+        hue = parse_hex(parts[-1])
+        if hue is None:
+            continue
+        out.append((parts[0], " ".join(parts[1:-1]), hue))
+    return out or [(s, n, rgb(*c)) for s, n, c in DEFAULT_MEMBERS]
+
+
+MEMBERS = load_roster()
+
+
+def crop_config(slug):
+    """Per-image crop tuning: "<slug> <focus> <zoom>" lines in crops.conf."""
+    for parts in read_conf("crops.conf"):
+        if len(parts) >= 3 and parts[0] == slug:
+            try:
+                return float(parts[1]), float(parts[2])
+            except ValueError:
+                continue
+    return None
+
+
+def member_for(key):
+    if not key:
+        return MEMBERS[0]
+    h = 5381
+    for byte in key.encode("utf-8"):
+        h = ((h * 33) + byte) & 0xFFFFFFFFFFFFFFFF
+    return MEMBERS[h % len(MEMBERS)]
+
+
+def day_seed():
+    """Local calendar day, so the rotation happens at your midnight, not UTC's."""
+    return time.strftime("%Y%m%d")
+
+
+def load_image(path):
+    """webp, png, jpg, jpeg, heic and svg all have pixbuf loaders on a normal desktop,
+    which is the set the README documents."""
+    try:
+        return GdkPixbuf.Pixbuf.new_from_file(path)
+    except GLib.Error:
+        return None
+
+
+def resolve_avatar(explicit, slug):
+    if explicit == "none":
+        return None
+    if explicit:
+        path = os.path.expanduser(explicit)
+        if os.path.exists(path):
+            return load_image(path)
+    names = [f"{slug}.{ext}" for ext in ("webp", "png", "jpg", "jpeg", "heic")]
+    path = portrait_file(*names)
+    return load_image(path) if path else None
+
+
+# ---------------------------------------------------------------- sound
+
+# The flags carry macOS system sound names. Map the ones notify-stop actually sends
+# onto freedesktop sound-theme ids; anything else is tried verbatim as an id.
+MAC_SOUNDS = {
+    "glass": "message",
+    "funk": "dialog-warning",
+    "ping": "message",
+    "hero": "complete",
+    "basso": "dialog-error",
+    "sosumi": "bell",
+    "submarine": "message-new-instant",
+}
+SOUND_EXTS = ("oga", "ogg", "wav", "flac", "mp3", "m4a")
+
+
+def resolve_sound(name):
+    """A path, a file in ~/.claude/sounds, or a sound-theme id. Returns (kind, value)."""
+    if not name or name == "none":
+        return None
+    direct = os.path.expanduser(name)
+    if os.path.exists(direct):
+        return ("file", direct)
+    event = MAC_SOUNDS.get(name.lower(), name.lower())
+    dirs = [os.path.join(HOME, ".claude/sounds"),
+            "/usr/share/sounds/freedesktop/stereo"]
+    for d in dirs:
+        for stem in (name, event):
+            for ext in SOUND_EXTS:
+                p = os.path.join(d, f"{stem}.{ext}")
+                if os.path.exists(p):
+                    return ("file", p)
+    return ("event", event)
+
+
+def play_sound(name, volume):
+    resolved = resolve_sound(name)
+    if not resolved:
+        return
+    kind, value = resolved
+    vol = max(0.0, min(1.0, volume))
+    if kind == "event":
+        cmd = ["canberra-gtk-play", "-i", value]
+    elif shutil_which("pw-play"):
+        cmd = ["pw-play", f"--volume={vol}", value]
+    elif shutil_which("paplay"):
+        cmd = ["paplay", f"--volume={int(vol * 65536)}", value]
+    else:
+        cmd = ["canberra-gtk-play", "-f", value]
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError:
+        pass
+
+
+def shutil_which(cmd):
+    import shutil
+    return shutil.which(cmd)
+
+
+# ---------------------------------------------------------------- options
+
+class Options:
+    def __init__(self):
+        self.title = "Claude"
+        self.badge = ""
+        self.repo = ""
+        self.branch = ""
+        self.body = ""
+        self.seconds = 5.0
+        self.accent = None
+        self.member = ""
+        self.avatar = ""
+        self.avatar_focus = None
+        self.avatar_zoom = None
+        self.avatar_size = 84.0
+        self.avatar_corner = 12.0
+        self.sound = "Glass"
+        self.volume = 1.0
+        self.logo = ""
+        self.logo_height = 30.0
+        self.logo_alpha = 0.58
+        self.on_click = ""
+        self.preview = ""
+        self.preview_backdrop = "8A8A8A"
+        self.preview_stack = 0
+        self.preview_expanded = False
+        self.serve = False
+        self.solo = False
+        self.screen = "main"
+
+
+def parse_args(argv):
+    o = Options()
+    i = 0
+
+    def take():
+        nonlocal i
+        i += 1
+        return argv[i] if i < len(argv) else ""
+
+    def num(default):
+        try:
+            return float(take())
+        except ValueError:
+            return default
+
+    while i < len(argv):
+        flag = argv[i]
+        if flag == "--title":
+            o.title = take()
+        elif flag == "--badge":
+            o.badge = take()
+        elif flag == "--repo":
+            o.repo = take()
+        elif flag == "--branch":
+            o.branch = take()
+        elif flag == "--body":
+            o.body = take()
+        elif flag == "--seconds":
+            o.seconds = num(o.seconds)
+        elif flag == "--accent":
+            o.accent = parse_hex(take())
+        elif flag == "--member":
+            o.member = take()
+        elif flag == "--avatar":
+            o.avatar = take()
+        elif flag == "--avatar-focus":
+            o.avatar_focus = num(0.30)
+        elif flag == "--avatar-zoom":
+            o.avatar_zoom = num(1.7)
+        elif flag == "--avatar-size":
+            o.avatar_size = num(84.0)
+        elif flag == "--avatar-corner":
+            o.avatar_corner = num(12.0)
+        elif flag == "--logo":
+            o.logo = take()
+        elif flag == "--logo-height":
+            o.logo_height = num(30.0)
+        elif flag == "--logo-alpha":
+            o.logo_alpha = num(0.58)
+        elif flag == "--sound":
+            o.sound = take()
+        elif flag == "--volume":
+            o.volume = num(o.volume)
+        elif flag == "--screen":
+            o.screen = take()
+        elif flag == "--on-click":
+            o.on_click = take()
+        elif flag == "--preview":
+            o.preview = take()
+        elif flag == "--preview-backdrop":
+            o.preview_backdrop = take()
+        elif flag == "--preview-stack":
+            o.preview_stack = int(num(0))
+        elif flag == "--preview-expanded":
+            o.preview_expanded = True
+        elif flag == "--serve":
+            o.serve = True
+        elif flag == "--solo":
+            o.solo = True
+        i += 1
+    return o
+
+
+# ---------------------------------------------------------------- card drawing
+
+def ui_font_family():
+    try:
+        name = Gtk.Settings.get_default().get_property("gtk-font-name") or ""
+    except Exception:
+        name = ""
+    # "Family Style 11" -> "Family"; the size and style are set per-label below.
+    desc = Pango.FontDescription(name) if name else None
+    return (desc.get_family() if desc and desc.get_family() else "Sans")
+
+
+_MEASURE_CTX = None
+
+
+def pango_context():
+    """A context detached from any widget, so measuring works before a frame exists."""
+    global _MEASURE_CTX
+    if _MEASURE_CTX is None:
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1)
+        _MEASURE_CTX = PangoCairo.create_context(cairo.Context(surface))
+    return _MEASURE_CTX
+
+
+def font(size, weight=Pango.Weight.NORMAL, mono=False):
+    desc = Pango.FontDescription()
+    desc.set_family("monospace" if mono else ui_font_family())
+    desc.set_weight(weight)
+    # Absolute (device-unit) sizing: the Swift card's point sizes are 1:1 with its
+    # pixels, and every other measurement here is in those same units.
+    desc.set_absolute_size(size * Pango.SCALE)
+    return desc
+
+
+def make_layout(text, desc, width=None, lines=1):
+    layout = Pango.Layout(pango_context())
+    layout.set_font_description(desc)
+    layout.set_text(text, -1)
+    if width is not None:
+        layout.set_width(int(width * Pango.SCALE))
+    if lines == 1:
+        layout.set_ellipsize(Pango.EllipsizeMode.END)
+        layout.set_single_paragraph_mode(True)
+    else:
+        layout.set_wrap(Pango.WrapMode.WORD_CHAR)
+        layout.set_ellipsize(Pango.EllipsizeMode.END)
+        # A negative height is a line budget: wrap up to `lines`, then ellipsize.
+        # Without it an ellipsizing layout collapses to a single line.
+        layout.set_height(-lines)
+    return layout
+
+
+def layout_size(layout):
+    w, h = layout.get_pixel_size()
+    return float(w), float(h)
+
+
+def rounded_rect(cr, x, y, w, h, r):
+    r = min(r, w / 2, h / 2)
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+_SURFACES = {}
+
+
+def image_surface(pixbuf):
+    """Converted once and kept: an animating stack redraws every card each frame, and
+    re-converting a 1000x1250 portrait sixty times a second is the whole budget."""
+    key = id(pixbuf)
+    if key not in _SURFACES:
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32,
+                                     pixbuf.get_width(), pixbuf.get_height())
+        cr = cairo.Context(surface)
+        Gdk.cairo_set_source_pixbuf(cr, pixbuf, 0, 0)
+        cr.paint()
+        _SURFACES[key] = (pixbuf, surface)   # the pixbuf keeps id() from being reused
+    return _SURFACES[key][1]
+
+
+class CardSpec:
+    """Everything the draw pass needs, measured once so the height is known up front."""
+
+    def __init__(self, opts):
+        self.opts = opts
+        identity = opts.badge or opts.repo
+        session_key = opts.badge.split(":")[0] if opts.badge else opts.repo
+
+        key = (opts.member or "").lower()
+        if key == "":
+            chosen = member_for(identity + "@" + day_seed())
+        elif key == "random":
+            import random
+            chosen = random.choice(MEMBERS)
+        elif key == "hash":
+            chosen = member_for(session_key)
+        else:
+            chosen = next((m for m in MEMBERS if m[0] == key), None) or member_for(identity)
+        self.member = chosen
+        self.signal = opts.accent or chosen[2]
+
+        self.avatar = resolve_avatar(opts.avatar, chosen[0])
+        crop = crop_config(chosen[0])
+        self.focus = opts.avatar_focus if opts.avatar_focus is not None else (crop[0] if crop else 0.30)
+        self.zoom = opts.avatar_zoom if opts.avatar_zoom is not None else (crop[1] if crop else 1.7)
+        self.lead_w = RAIL_W if self.avatar is None else opts.avatar_size
+
+        self.logo = self._load_logo()
+        if self.logo is not None:
+            ratio = self.logo.get_width() / max(1, self.logo.get_height())
+            self.logo_w = opts.logo_height * ratio
+            self.logo_reserve = self.logo_w + 14
+        else:
+            self.logo_w = 0.0
+            self.logo_reserve = 0.0
+
+        self.text_w = CARD_W - CARD_PAD * 2 - self.lead_w - 14 - self.logo_reserve
+        self._measure()
+
+    def _load_logo(self):
+        if self.opts.logo == "none":
+            return None
+        if self.opts.logo:
+            path = os.path.expanduser(self.opts.logo)
+            return load_image(path) if os.path.exists(path) else None
+        path = portrait_file("logo.svg", "logo.png")
+        return load_image(path) if path else None
+
+    def _measure(self):
+        o = self.opts
+        self.title_layout = make_layout(o.title, font(15, Pango.Weight.SEMIBOLD), self.text_w)
+        self.title_h = layout_size(self.title_layout)[1]
+
+        # Laid out by hand so a long repo name yields before the badge does; the badge
+        # is the one piece that must stay whole, it is how you find the pane.
+        self.meta = []
+        if o.badge:
+            self.meta.append(["badge", o.badge, font(11.5, Pango.Weight.MEDIUM, mono=True),
+                              self.signal, 0.0])
+        if o.repo:
+            self.meta.append(["repo", o.repo, font(11.5), INK_META, 0.0])
+        if o.branch:
+            self.meta.append(["branch", o.branch, font(11.5), INK_FAINT, 0.0])
+        self.meta_h = 0.0
+        if self.meta:
+            for item in self.meta:
+                item[4] = layout_size(make_layout(item[1], item[2]))[0]
+            self._fit_meta()
+            self.meta_h = max(layout_size(make_layout(i[1], i[2]))[1] for i in self.meta)
+
+        self.body_layout = None
+        self.body_h = 0.0
+        if o.body:
+            self.body_layout = make_layout(o.body, font(12.5), self.text_w, lines=2)
+            self.body_h = layout_size(self.body_layout)[1]
+
+        content = self.title_h
+        if self.meta:
+            content += 4 + self.meta_h
+        if self.body_layout is not None:
+            content += 9 + self.body_h
+        height = max(content + (CARD_PAD - 1) * 2, 66.0)
+        if self.avatar is not None:
+            height = max(height, o.avatar_size + CARD_PAD * 2)
+        self.height = math.ceil(height)
+
+    def _fit_meta(self):
+        """Shrink in the order the Swift layout's compression priorities imply:
+        repo first, then branch; the badge is never squeezed."""
+        gaps = 10.0 * (len(self.meta) - 1)
+        over = sum(i[4] for i in self.meta) + gaps - self.text_w
+        if over <= 0:
+            return
+        for name in ("repo", "branch"):
+            for item in self.meta:
+                if item[0] != name or over <= 0:
+                    continue
+                take = min(over, max(0.0, item[4] - 24))
+                item[4] -= take
+                over -= take
+
+    # ------------------------------------------------------------ paint
+
+    def draw(self, cr, width=None, height=None):
+        o = self.opts
+        w = width if width is not None else CARD_W
+        h = height if height is not None else self.height
+
+        cr.save()
+        rounded_rect(cr, 0, 0, w, h, CARD_CORNER)
+        cr.clip_preserve()
+        grad = cairo.LinearGradient(0, 0, 0, h)
+        grad.add_color_stop_rgba(0, *BASE_TOP, BASE_ALPHA)
+        grad.add_color_stop_rgba(1, *BASE_BOTTOM, BASE_ALPHA)
+        cr.set_source(grad)
+        cr.fill()
+        cr.restore()
+
+        cr.save()
+        rounded_rect(cr, 0.5, 0.5, w - 1, h - 1, CARD_CORNER)
+        cr.set_source_rgb(*EDGE)
+        cr.set_line_width(1)
+        cr.stroke()
+        cr.restore()
+
+        self._draw_lead(cr, h)
+        self._draw_text(cr, h)
+        self._draw_logo(cr, w, h)
+
+    def _draw_lead(self, cr, h):
+        o = self.opts
+        if self.avatar is None:
+            cr.save()
+            rounded_rect(cr, CARD_PAD, CARD_PAD, RAIL_W, h - CARD_PAD * 2, RAIL_W / 2)
+            cr.set_source_rgb(*self.signal)
+            cr.fill()
+            cr.restore()
+            return
+
+        size = o.avatar_size
+        x, y = CARD_PAD, (h - size) / 2
+        iw, ih = float(self.avatar.get_width()), float(self.avatar.get_height())
+        side = min(iw, ih) / max(1.0, self.zoom)
+        # focus is a fraction from the top and names the centre of the crop; clamped
+        # so the square never leaves the image.
+        sx = (iw - side) / 2
+        sy = max(0.0, min(ih - side, self.focus * ih - side / 2))
+        scale = size / side
+
+        cr.save()
+        rounded_rect(cr, x, y, size, size, o.avatar_corner)
+        cr.clip()
+        cr.translate(x, y)
+        cr.scale(scale, scale)
+        cr.set_source_surface(image_surface(self.avatar), -sx, -sy)
+        cr.get_source().set_filter(cairo.FILTER_GOOD)
+        cr.paint()
+        cr.restore()
+
+        cr.save()
+        rounded_rect(cr, x + 1.25, y + 1.25, size - 2.5, size - 2.5, o.avatar_corner - 1.25)
+        cr.set_source_rgb(*self.signal)
+        cr.set_line_width(2.5)
+        cr.stroke()
+        cr.restore()
+
+    def _draw_text(self, cr, h):
+        x = CARD_PAD + self.lead_w + 14
+        y = CARD_PAD - 1
+
+        cr.save()
+        cr.move_to(x, y)
+        cr.set_source_rgb(*INK)
+        PangoCairo.show_layout(cr, self.title_layout)
+        cr.restore()
+        y += self.title_h
+
+        if self.meta:
+            y += 4
+            mx = x
+            for _, text, desc, colour, width in self.meta:
+                layout = make_layout(text, desc, width)
+                cr.save()
+                cr.move_to(mx, y)
+                cr.set_source_rgb(*colour)
+                PangoCairo.show_layout(cr, layout)
+                cr.restore()
+                mx += width + 10
+            y += self.meta_h
+
+        if self.body_layout is not None:
+            y += 9
+            cr.save()
+            cr.rectangle(x, y, self.text_w, self.body_h)
+            cr.clip()
+            cr.move_to(x, y)
+            cr.set_source_rgb(*INK_BODY)
+            PangoCairo.show_layout(cr, self.body_layout)
+            cr.restore()
+
+    def _draw_logo(self, cr, w, h):
+        if self.logo is None:
+            return
+        o = self.opts
+        lw, lh = self.logo_w, o.logo_height
+        x = w - CARD_PAD - lw
+        y = (h - lh) / 2
+        surface = image_surface(self.logo)
+        cr.save()
+        cr.translate(x, y)
+        cr.scale(lw / self.logo.get_width(), lh / self.logo.get_height())
+        # mask, not paint: the mark is flat black, so its own alpha recolours it.
+        cr.set_source_rgba(*LOGO_TINT, o.logo_alpha)
+        cr.mask_surface(surface, 0, 0)
+        cr.restore()
+
+
+# ---------------------------------------------------------------- preview
+
+def stack_geometry(specs, expanded):
+    """Shared by the live stack and --preview-stack: where each card sits, how far it
+    has faded, and how tall the surface has to be. Index 0 is the newest card."""
+    places = []
+    if not specs:
+        return places, 0.0, []
+    if expanded:
+        y = 0.0
+        for spec in specs:
+            places.append((spec, y, 1.0))
+            y += spec.height + GAP
+        return places, max(0.0, y - GAP), []
+
+    # Everything tucks back behind the front card and fades, rather than
+    # disappearing the instant the pointer leaves.
+    for index, spec in enumerate(specs):
+        places.append((spec, 0.0, 1.0 if index == 0 else 0.0))
+    front = specs[0]
+    peek_count = min(len(specs) - 1, MAX_PEEKS)
+    peeks = []
+    for i in range(peek_count):
+        inset = (i + 1) * 13.0
+        peeks.append((inset,
+                      front.height + i * PEEK_STEP - CARD_CORNER,
+                      CARD_W - inset * 2,
+                      CARD_CORNER + PEEK_STEP))
+    return places, front.height + peek_count * PEEK_STEP, peeks
+
+
+def draw_peek(cr, x, y, w, h):
+    cr.save()
+    rounded_rect(cr, x, y, w, h, CARD_CORNER)
+    cr.set_source_rgba(*BASE_BOTTOM, BASE_ALPHA)
+    cr.fill_preserve()
+    cr.set_source_rgba(*EDGE, 0.7)
+    cr.set_line_width(1)
+    cr.stroke()
+    cr.restore()
+
+
+def render_preview(opts):
+    backdrop = None
+    if opts.preview_backdrop != "none":
+        backdrop = parse_hex(opts.preview_backdrop) or (0.54, 0.54, 0.54)
+    path = os.path.expanduser(opts.preview)
+
+    if opts.preview_stack > 0:
+        specs = []
+        for i in range(opts.preview_stack):
+            o = parse_args([])
+            o.__dict__.update(opts.__dict__)
+            o.preview = ""
+            o.title = f"✳ card {opts.preview_stack - i}"
+            o.badge = f"demo:{i + 1}.1"
+            o.sound = "none"
+            specs.append(CardSpec(o))
+        places, height, peeks = stack_geometry(specs, opts.preview_expanded)
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, int(CARD_W), int(math.ceil(height)))
+        cr = cairo.Context(surface)
+        if backdrop:
+            cr.set_source_rgb(*backdrop)
+            cr.paint()
+        for x, y, w, h in peeks:
+            draw_peek(cr, x, y, w, h)
+        for spec, y, alpha in reversed(places):
+            if alpha <= 0:
+                continue
+            cr.save()
+            cr.translate(0, y)
+            cr.push_group()
+            spec.draw(cr)
+            cr.pop_group_to_source()
+            cr.paint_with_alpha(alpha)
+            cr.restore()
+        surface.write_to_png(path)
+        print(f"stack preview: {int(CARD_W)}x{int(height)} cards={len(specs)} "
+              f"peeks={len(peeks)} expanded={opts.preview_expanded}")
+        return
+
+    spec = CardSpec(opts)
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, int(CARD_W), int(spec.height))
+    cr = cairo.Context(surface)
+    if backdrop:
+        cr.set_source_rgb(*backdrop)
+        cr.paint()
+    spec.draw(cr)
+    surface.write_to_png(path)
+    print(f"preview written: {opts.preview}  {int(CARD_W)}x{int(spec.height)}")
+
+
+# ---------------------------------------------------------------- live stack
+
+def bezier(p1x, p1y, p2x, p2y):
+    """CAMediaTimingFunction's curve, solved the same way CoreAnimation solves it."""
+    def curve_x(t):
+        return 3 * (1 - t) ** 2 * t * p1x + 3 * (1 - t) * t ** 2 * p2x + t ** 3
+
+    def curve_y(t):
+        return 3 * (1 - t) ** 2 * t * p1y + 3 * (1 - t) * t ** 2 * p2y + t ** 3
+
+    def solve(x):
+        lo, hi = 0.0, 1.0
+        for _ in range(24):
+            mid = (lo + hi) / 2
+            if curve_x(mid) < x:
+                lo = mid
+            else:
+                hi = mid
+        return curve_y((lo + hi) / 2)
+
+    return solve
+
+
+EASE = bezier(0.16, 1.0, 0.3, 1.0)
+DURATION = 0.38
+
+
+class Card:
+    """One notification. Clicking runs its command; hovering the stack pauses its clock."""
+
+    def __init__(self, spec, opts):
+        self.spec = spec
+        self.on_click = opts.on_click
+        self.deadline = time.monotonic() + opts.seconds
+        self.dismissed = False
+        self.y = 0.0
+        self.alpha = 1.0
+        self.from_y = 0.0
+        self.from_alpha = 1.0
+        self.to_y = 0.0
+        self.to_alpha = 1.0
+
+        self.area = Gtk.DrawingArea()
+        self.area.set_size_request(int(CARD_W), int(spec.height))
+        self.area.set_draw_func(self._draw)
+
+        click = Gtk.GestureClick.new()
+        click.connect("released", self._clicked)
+        self.area.add_controller(click)
+
+    def _draw(self, area, cr, w, h):
+        if self.alpha <= 0.001:
+            return
+        cr.push_group()
+        self.spec.draw(cr, w, h)
+        cr.pop_group_to_source()
+        cr.paint_with_alpha(self.alpha)
+
+    def _clicked(self, gesture, n_press, x, y):
+        if self.on_click:
+            try:
+                subprocess.Popen(["/bin/sh", "-c", self.on_click],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+            except OSError:
+                pass
+        CONTROLLER.dismiss(self)
+
+
+class StackController:
+    """Owns the one surface every notification is drawn into. Collapsed, only the
+    newest card is readable and the rest peek beneath it; hovering expands the stack
+    and holds every clock until the pointer leaves."""
+
+    def __init__(self, solo, loop):
+        self.solo = solo
+        self.loop = loop
+        self.cards = []
+        self.peeks = []
+        self.expanded = False
+        self.idle_since = time.monotonic()
+        self.anim_start = None
+        self.height = 0.0
+        self.from_height = 0.0
+        self.to_height = 0.0
+
+        self.window = Gtk.Window()
+        self.window.set_decorated(False)
+        self.window.add_css_class("claude-hud")
+        self.fixed = Gtk.Fixed()
+        self.window.set_child(self.fixed)
+
+        css = Gtk.CssProvider()
+        css.load_from_data(b"window.claude-hud { background: transparent; }")
+        Gtk.StyleContext.add_provider_for_display(
+            self.window.get_display(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        LayerShell.init_for_window(self.window)
+        LayerShell.set_layer(self.window, LayerShell.Layer.OVERLAY)
+        LayerShell.set_anchor(self.window, LayerShell.Edge.TOP, True)
+        LayerShell.set_margin(self.window, LayerShell.Edge.TOP, TOP_MARGIN)
+        LayerShell.set_keyboard_mode(self.window, LayerShell.KeyboardMode.NONE)
+        LayerShell.set_namespace(self.window, "claude-hud")
+
+        motion = Gtk.EventControllerMotion.new()
+        motion.connect("enter", self._enter)
+        motion.connect("leave", self._leave)
+        self.window.add_controller(motion)
+
+        GLib.timeout_add(100, self._tick)
+
+    # -------------------------------------------------------- stack changes
+
+    def add(self, opts):
+        spec = CardSpec(opts)
+        card = Card(spec, opts)
+        self.cards.insert(0, card)
+        self.fixed.put(card.area, 0, 0)
+        self.idle_since = time.monotonic()
+        play_sound(opts.sound, opts.volume)
+        self.relayout(animated=False)
+        if not self.window.get_visible():
+            self.window.present()
+
+    def dismiss(self, card):
+        if card.dismissed:
+            return
+        card.dismissed = True
+        self.cards = [c for c in self.cards if c is not card]
+        self.fixed.remove(card.area)
+        self.idle_since = time.monotonic()
+        if not self.cards:
+            self.hide()
+        else:
+            self.relayout(animated=True)
+
+    def hide(self):
+        self.window.set_visible(False)
+        for peek in self.peeks:
+            self.fixed.remove(peek)
+        self.peeks = []
+        if self.solo:
+            self.loop.quit()
+
+    # -------------------------------------------------------- hover + clock
+
+    def _enter(self, controller, x, y):
+        if not self.expanded and len(self.cards) > 1:
+            self.expanded = True
+            self.relayout(animated=True)
+
+    def _leave(self, controller):
+        if self.expanded:
+            self.expanded = False
+            # The clocks were held while the pointer sat on the stack; give what is
+            # left a short, equal tail rather than expiring everything at once.
+            for card in self.cards:
+                card.deadline = time.monotonic() + 3
+            self.relayout(animated=True)
+
+    def _tick(self):
+        now = time.monotonic()
+        if self.expanded:
+            for card in self.cards:
+                card.deadline = max(card.deadline, now + 0.3)
+        else:
+            for card in list(self.cards):
+                if card.deadline <= now:
+                    self.dismiss(card)
+        if not self.solo and not self.cards and now - self.idle_since > 45:
+            self.loop.quit()
+            return False
+        return True
+
+    # -------------------------------------------------------- geometry
+
+    def relayout(self, animated):
+        if not self.cards:
+            return
+        specs = [c.spec for c in self.cards]
+        places, height, peeks = stack_geometry(specs, self.expanded)
+
+        for peek in self.peeks:
+            self.fixed.remove(peek)
+        self.peeks = []
+        for x, y, w, h in peeks:
+            area = Gtk.DrawingArea()
+            area.set_size_request(int(math.ceil(w)), int(math.ceil(h)))
+            area.set_draw_func(lambda a, cr, aw, ah: draw_peek(cr, 0.5, 0.5, aw - 1, ah - 1))
+            # Below every card: Gtk.Fixed stacks in insertion order, so put it in
+            # first and move the cards back on top.
+            self.fixed.put(area, x, y)
+            self.peeks.append(area)
+        for card in self.cards:
+            self.fixed.remove(card.area)
+            self.fixed.put(card.area, 0, card.y)
+
+        for card, (_, y, alpha) in zip(self.cards, places):
+            card.from_y, card.from_alpha = card.y, card.alpha
+            card.to_y, card.to_alpha = y, alpha
+        self.from_height, self.to_height = self.height or height, height
+
+        if animated:
+            self.anim_start = time.monotonic()
+            self.window.add_tick_callback(self._frame)
+        else:
+            self._apply(1.0)
+
+    def _frame(self, widget, clock):
+        if self.anim_start is None:
+            return GLib.SOURCE_REMOVE
+        t = (time.monotonic() - self.anim_start) / DURATION
+        if t >= 1.0:
+            self._apply(1.0)
+            self.anim_start = None
+            return GLib.SOURCE_REMOVE
+        self._apply(EASE(max(0.0, t)))
+        return GLib.SOURCE_CONTINUE
+
+    def _apply(self, p):
+        for card in self.cards:
+            card.y = card.from_y + (card.to_y - card.from_y) * p
+            card.alpha = card.from_alpha + (card.to_alpha - card.from_alpha) * p
+            self.fixed.move(card.area, 0, card.y)
+            card.area.queue_draw()
+        self.height = self.from_height + (self.to_height - self.from_height) * p
+        self.window.set_size_request(int(CARD_W), int(math.ceil(self.height)))
+
+
+# ---------------------------------------------------------------- socket
+
+def socket_path():
+    base = os.environ.get("XDG_RUNTIME_DIR") or os.environ.get("TMPDIR") or "/tmp"
+    return os.path.join(base, "claude-hud.sock")
+
+
+def post(argv):
+    try:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(1.0)
+        client.connect(socket_path())
+        client.sendall(json.dumps(argv).encode("utf-8") + b"\n")
+        client.close()
+        return True
+    except OSError:
+        return False
+
+
+def serve():
+    path = socket_path()
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    try:
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(path)
+        server.listen(16)
+    except OSError:
+        return None
+    server.setblocking(False)
+
+    def accept(source, condition):
+        try:
+            client, _ = server.accept()
+        except OSError:
+            return True
+        with client:
+            client.settimeout(1.0)
+            chunks = []
+            try:
+                while True:
+                    data = client.recv(65536)
+                    if not data:
+                        break
+                    chunks.append(data)
+            except OSError:
+                pass
+        for line in b"".join(chunks).split(b"\n"):
+            if not line.strip():
+                continue
+            try:
+                argv = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(argv, list):
+                CONTROLLER.add(parse_args([str(a) for a in argv]))
+        return True
+
+    GLib.io_add_watch(GLib.IOChannel.unix_new(server.fileno()),
+                      GLib.PRIORITY_DEFAULT, GLib.IOCondition.IN, accept)
+    return server
+
+
+CONTROLLER = None
+LayerShell = None
+
+
+def main():
+    global CONTROLLER, LayerShell
+    argv = sys.argv[1:]
+    opts = parse_args(argv)
+
+    if opts.preview:
+        render_preview(opts)
+        return 0
+
+    gi.require_version("Gtk4LayerShell", "1.0")
+    from gi.repository import Gtk4LayerShell
+    LayerShell = Gtk4LayerShell
+    Gtk.init()
+    if not LayerShell.is_supported():
+        sys.stderr.write("claude-hud: compositor has no zwlr_layer_shell_v1\n")
+        return 1
+
+    loop = GLib.MainLoop()
+
+    if opts.serve:
+        CONTROLLER = StackController(solo=False, loop=loop)
+        if serve() is None:
+            return 0                       # another daemon already owns the socket
+        loop.run()
+        return 0
+
+    # Try the daemon; start one if absent; fall back to a standalone stack if that
+    # fails, so a wedged daemon never costs a notification.
+    if not opts.solo:
+        if post(argv):
+            return 0
+        try:
+            subprocess.Popen([sys.executable, os.path.realpath(__file__), "--serve"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        except OSError:
+            pass
+        for _ in range(40):
+            time.sleep(0.025)
+            if post(argv):
+                return 0
+
+    CONTROLLER = StackController(solo=True, loop=loop)
+    CONTROLLER.add(opts)
+    loop.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
