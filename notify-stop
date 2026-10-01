@@ -90,15 +90,19 @@ if [[ ${CLAUDE_NOTIFY_ALWAYS:-0} != 1 && -n ${TMUX_PANE:-} ]]; then
   fi
 fi
 
-# A fullscreen window is a game, a film or a presentation, and the HUD draws on the
-# overlay layer — above fullscreen, right across the middle of it. Suppress the card
-# and its chime, but fall through to the banner so the turn is still recorded and
-# waiting when you tab out. CLAUDE_NOTIFY_ALWAYS=1 overrides this as it does the
-# watching-the-pane check; CLAUDE_NOTIFY_SKIP_FULLSCREEN=0 turns it off for good.
+# Two rules suppress the card and its chime but deliberately fall through to the
+# banner, so the turn is still recorded and waiting when you come back. Both are
+# Linux-only: macOS has no probe for either that does not want accessibility
+# permission. CLAUDE_NOTIFY_ALWAYS=1 overrides them, as it does the
+# watching-the-pane check.
 hud_suppressed=0
-if [[ ${CLAUDE_NOTIFY_ALWAYS:-0} != 1 && ${CLAUDE_NOTIFY_SKIP_FULLSCREEN:-1} == 1 ]]; then
-  fsmode=0
-  if [[ $os == linux ]]; then
+suppress_reason=""
+
+if [[ ${CLAUDE_NOTIFY_ALWAYS:-0} != 1 && $os == linux ]]; then
+  # 1. A fullscreen window is a game, a film or a presentation, and the HUD draws on
+  #    the overlay layer — above fullscreen, right across the middle of it.
+  if [[ ${CLAUDE_NOTIFY_SKIP_FULLSCREEN:-1} == 1 ]]; then
+    fsmode=0
     if command -v hyprctl >/dev/null 2>&1; then
       fsmode=$("$JQ" -r '.fullscreen // 0' <<<"$(hyprctl activewindow -j 2>/dev/null)" 2>/dev/null)
     elif command -v swaymsg >/dev/null 2>&1; then
@@ -106,14 +110,38 @@ if [[ ${CLAUDE_NOTIFY_ALWAYS:-0} != 1 && ${CLAUDE_NOTIFY_SKIP_FULLSCREEN:-1} == 
         | "$JQ" -e 'first(.. | select(.focused? == true) | select((.fullscreen_mode? // 0) > 0))' \
           >/dev/null 2>&1 && fsmode=2
     fi
+    # Hyprland reports a bitmask: 1 is maximized, 2 is fullscreen, 3 is both. Only
+    # bit 2 means the window actually covers the screen — a maximized window is just
+    # a window, and the HUD belongs over it.
+    if [[ ${fsmode:-0} =~ ^[0-9]+$ ]] && (( fsmode & 2 )); then
+      hud_suppressed=1
+      suppress_reason="the focused window is fullscreen"
+    fi
   fi
-  # Hyprland's fsmode is a bitmask: 1 is maximized, 2 is fullscreen, 3 is both. Only
-  # bit 2 means the window actually covers the screen — a maximized window is just a
-  # window, and the HUD belongs over it.
-  if [[ ${fsmode:-0} =~ ^[0-9]+$ ]] && (( fsmode & 2 )); then
-    hud_suppressed=1
-    [[ ${CLAUDE_NOTIFY_DEBUG:-0} == 1 ]] && echo "notify-stop: HUD suppressed, the focused window is fullscreen" >&2
+
+  # 2. Your notification daemon is in do-not-disturb. The HUD is a notification too,
+  #    and a louder one than the banner, so one toggle should silence both.
+  if [[ $hud_suppressed == 0 && ${CLAUDE_NOTIFY_SKIP_DND:-1} == 1 ]]; then
+    dnd=0
+    if command -v makoctl >/dev/null 2>&1; then
+      # mako modes are arbitrary user-defined strings; do-not-disturb is the
+      # convention, and what omarchy-toggle-notification-silencing flips.
+      makoctl mode 2>/dev/null \
+        | grep -qxF "${CLAUDE_NOTIFY_DND_MODE:-do-not-disturb}" && dnd=1
+    elif command -v dunstctl >/dev/null 2>&1; then
+      [[ $(dunstctl is-paused 2>/dev/null) == true ]] && dnd=1
+    elif command -v swaync-client >/dev/null 2>&1; then
+      [[ $(swaync-client --get-dnd 2>/dev/null) == true ]] && dnd=1
+    fi
+    if [[ $dnd == 1 ]]; then
+      hud_suppressed=1
+      suppress_reason="your notification daemon is in do-not-disturb"
+    fi
   fi
+fi
+
+if [[ $hud_suppressed == 1 && ${CLAUDE_NOTIFY_DEBUG:-0} == 1 ]]; then
+  echo "notify-stop: HUD suppressed, $suppress_reason" >&2
 fi
 
 # A git pull can bring a newer source than the compiled binary, and nothing else

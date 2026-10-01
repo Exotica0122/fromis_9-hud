@@ -236,20 +236,34 @@ attached session, the terminal is frontmost, and the screen is not locked. "Fron
 "locked" is the `CGSSessionScreenIsLocked` key on macOS and a running `hyprlock`/`swaylock`
 or `loginctl`'s `LockedHint` on Linux. Set `CLAUDE_NOTIFY_ALWAYS=1` to notify regardless.
 
-On Linux it also stays quiet while the focused window is **fullscreen** — a game, a film,
-a presentation. The HUD draws on the `overlay` layer, which the compositor puts *above*
-fullscreen windows, so without this it lands in the middle of the playfield. The card and
-its chime are skipped, but the banner still goes out, so the turn is waiting in your
-notification history when you tab back out.
+On Linux two further rules keep the card out of the way. Both skip the card *and its
+chime* but still post the banner, so the turn is waiting in your notification history
+when you come back — suppressed, not discarded.
 
-The test is the focused window only: a fullscreen game parked on another workspace while
-you work in the terminal does not suppress anything. Hyprland reports the state as a
-bitmask, and only true fullscreen counts — a merely maximized window is still a window,
-and the HUD belongs over it. `CLAUDE_NOTIFY_SKIP_FULLSCREEN=0` turns the rule off;
-`CLAUDE_NOTIFY_ALWAYS=1` overrides it along with the watching-the-pane check.
+**A fullscreen focused window** — a game, a film, a presentation. The HUD draws on the
+`overlay` layer, which the compositor puts *above* fullscreen windows, so without this it
+lands in the middle of the playfield. Only the focused window counts: a fullscreen game
+parked on another workspace while you work in the terminal suppresses nothing. Hyprland
+reports the state as a bitmask and only the fullscreen bit qualifies — a merely maximized
+window is still a window, and the HUD belongs over it.
 
-There is no macOS equivalent yet: detecting a fullscreen Space from a shell needs
-accessibility permission, which is a worse trade than the feature is worth.
+**Your notification daemon in do-not-disturb** — the HUD is a notification too, and a
+louder one than the banner, so one toggle should silence both. On Omarchy that toggle is
+already bound: `omarchy-toggle-notification-silencing` flips mako's `do-not-disturb` mode.
+`makoctl`, `dunstctl is-paused` and `swaync-client --get-dnd` are all understood. mako
+modes are arbitrary strings, so `CLAUDE_NOTIFY_DND_MODE` sets which one to match if you
+do not call yours `do-not-disturb`.
+
+| Variable | Effect |
+|---|---|
+| `CLAUDE_NOTIFY_SKIP_FULLSCREEN=0` | show the HUD over fullscreen windows anyway |
+| `CLAUDE_NOTIFY_SKIP_DND=0` | ignore the notification daemon's mode |
+| `CLAUDE_NOTIFY_DND_MODE=<name>` | the mako mode that counts as do-not-disturb |
+| `CLAUDE_NOTIFY_ALWAYS=1` | override all of this, and the watching-the-pane check |
+
+Neither rule has a macOS counterpart. Reading a fullscreen Space or a Focus mode from a
+shell wants accessibility permission or an undocumented plist, which is a worse trade than
+the feature is worth.
 
 On Linux, `gtk4-layer-shell` has to interpose `libwayland-client` before GTK opens the
 display, which a Python process cannot arrange after import. `claude-hud-gtk` therefore
@@ -294,6 +308,8 @@ CLAUDE_NOTIFY_MEMBER=jiwon    # pin a member instead of picking at random
 CLAUDE_NOTIFY_ACCENT='#f59e0b'
 CLAUDE_NOTIFY_NATIVE=0        # skip the persistent banner
 CLAUDE_NOTIFY_SKIP_FULLSCREEN=0   # Linux: show the HUD even over a fullscreen window
+CLAUDE_NOTIFY_SKIP_DND=0      # Linux: show the HUD even in do-not-disturb
+CLAUDE_NOTIFY_DND_MODE=quiet  # the mako mode that counts as do-not-disturb
 CLAUDE_TERMINAL_APP=Ghostty   # which app focus-pane raises
 CLAUDE_HUD_PORTRAITS=~/pics   # where portraits and their config live
 ```

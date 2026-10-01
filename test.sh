@@ -92,8 +92,9 @@ else
 fi
 
 echo "fullscreen"
-# A stub compositor rather than the real one: the suite must assert the same thing
-# whether or not anything happens to be fullscreen while it runs.
+# Stub compositor and notification daemon rather than the real ones: the suite must
+# assert the same thing whatever is fullscreen, and whatever mode mako is in, while
+# it runs. Both are stubbed throughout so neither rule can mask the other.
 fake=$tmp/fake; mkdir -p "$fake"
 hypr_stub() {                  # hypr_stub <fullscreen-mode>
   cat > "$fake/hyprctl" <<STUB
@@ -102,7 +103,16 @@ echo '{"class":"someapp","fullscreen":$1}'
 STUB
   chmod +x "$fake/hyprctl"
 }
+mako_stub() {                  # mako_stub <mode>
+  cat > "$fake/makoctl" <<STUB
+#!/usr/bin/env bash
+[[ \$1 == mode ]] && echo '$1'
+exit 0
+STUB
+  chmod +x "$fake/makoctl"
+}
 if [[ $(uname) == Linux ]]; then
+  mako_stub default
   hypr_stub 2
   args=$(run "$(payload Stop)" PATH="$fake:$PATH" CLAUDE_NOTIFY_NATIVE=0)
   [[ -z $args ]] && ok "a fullscreen window suppresses the card" \
@@ -133,9 +143,49 @@ if [[ $(uname) == Linux ]]; then
   args=$(run "$(payload Stop)" PATH="$fake:$PATH" CLAUDE_NOTIFY_NATIVE=0 CLAUDE_NOTIFY_SKIP_FULLSCREEN=0)
   [[ -n $args ]] && ok "CLAUDE_NOTIFY_SKIP_FULLSCREEN=0 turns it off" \
                  || bad "CLAUDE_NOTIFY_SKIP_FULLSCREEN=0 turns it off" "stayed silent"
-  rm -f "$fake/hyprctl"
 else
   note "skipped: fullscreen suppression has no macOS probe yet"
+fi
+
+echo "do-not-disturb"
+if [[ $(uname) == Linux ]]; then
+  hypr_stub 0                  # pin the other rule off, so this one is what is tested
+  mako_stub do-not-disturb
+  args=$(run "$(payload Stop)" PATH="$fake:$PATH" CLAUDE_NOTIFY_NATIVE=0)
+  [[ -z $args ]] && ok "do-not-disturb suppresses the card" \
+                 || bad "do-not-disturb suppresses the card" "rendered anyway"
+
+  out=$(printf '%s' "$(payload Stop)" \
+    | env PATH="$fake:$PATH" CLAUDE_NOTIFY_DEBUG=1 "$here/notify-stop" 2>&1 >/dev/null)
+  check "and still records it in a banner"   "$out" "banner=["
+  check "saying why it went quiet"           "$out" "do-not-disturb"
+
+  mako_stub default
+  args=$(run "$(payload Stop)" PATH="$fake:$PATH" CLAUDE_NOTIFY_NATIVE=0)
+  [[ -n $args ]] && ok "the default mode does not" \
+                 || bad "the default mode does not" "stayed silent"
+
+  mako_stub do-not-disturb
+  args=$(run "$(payload Stop)" PATH="$fake:$PATH" CLAUDE_NOTIFY_NATIVE=0 CLAUDE_NOTIFY_SKIP_DND=0)
+  [[ -n $args ]] && ok "CLAUDE_NOTIFY_SKIP_DND=0 turns it off" \
+                 || bad "CLAUDE_NOTIFY_SKIP_DND=0 turns it off" "stayed silent"
+
+  args=$(run "$(payload Stop)" PATH="$fake:$PATH" CLAUDE_NOTIFY_NATIVE=0 CLAUDE_NOTIFY_ALWAYS=1)
+  [[ -n $args ]] && ok "CLAUDE_NOTIFY_ALWAYS overrides it" \
+                 || bad "CLAUDE_NOTIFY_ALWAYS overrides it" "stayed silent"
+
+  # mako modes are arbitrary strings, so the one we match on has to be settable.
+  mako_stub quiet-please
+  args=$(run "$(payload Stop)" PATH="$fake:$PATH" CLAUDE_NOTIFY_NATIVE=0)
+  [[ -n $args ]] && ok "an unrelated mode is not do-not-disturb" \
+                 || bad "an unrelated mode is not do-not-disturb" "stayed silent"
+  args=$(run "$(payload Stop)" PATH="$fake:$PATH" CLAUDE_NOTIFY_NATIVE=0 CLAUDE_NOTIFY_DND_MODE=quiet-please)
+  [[ -z $args ]] && ok "CLAUDE_NOTIFY_DND_MODE matches a custom mode" \
+                 || bad "CLAUDE_NOTIFY_DND_MODE matches a custom mode" "rendered anyway"
+
+  rm -f "$fake/hyprctl" "$fake/makoctl"
+else
+  note "skipped: no macOS do-not-disturb probe"
 fi
 
 echo "hud binary"
