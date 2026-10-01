@@ -90,6 +90,32 @@ if [[ ${CLAUDE_NOTIFY_ALWAYS:-0} != 1 && -n ${TMUX_PANE:-} ]]; then
   fi
 fi
 
+# A fullscreen window is a game, a film or a presentation, and the HUD draws on the
+# overlay layer — above fullscreen, right across the middle of it. Suppress the card
+# and its chime, but fall through to the banner so the turn is still recorded and
+# waiting when you tab out. CLAUDE_NOTIFY_ALWAYS=1 overrides this as it does the
+# watching-the-pane check; CLAUDE_NOTIFY_SKIP_FULLSCREEN=0 turns it off for good.
+hud_suppressed=0
+if [[ ${CLAUDE_NOTIFY_ALWAYS:-0} != 1 && ${CLAUDE_NOTIFY_SKIP_FULLSCREEN:-1} == 1 ]]; then
+  fsmode=0
+  if [[ $os == linux ]]; then
+    if command -v hyprctl >/dev/null 2>&1; then
+      fsmode=$("$JQ" -r '.fullscreen // 0' <<<"$(hyprctl activewindow -j 2>/dev/null)" 2>/dev/null)
+    elif command -v swaymsg >/dev/null 2>&1; then
+      swaymsg -t get_tree 2>/dev/null \
+        | "$JQ" -e 'first(.. | select(.focused? == true) | select((.fullscreen_mode? // 0) > 0))' \
+          >/dev/null 2>&1 && fsmode=2
+    fi
+  fi
+  # Hyprland's fsmode is a bitmask: 1 is maximized, 2 is fullscreen, 3 is both. Only
+  # bit 2 means the window actually covers the screen — a maximized window is just a
+  # window, and the HUD belongs over it.
+  if [[ ${fsmode:-0} =~ ^[0-9]+$ ]] && (( fsmode & 2 )); then
+    hud_suppressed=1
+    [[ ${CLAUDE_NOTIFY_DEBUG:-0} == 1 ]] && echo "notify-stop: HUD suppressed, the focused window is fullscreen" >&2
+  fi
+fi
+
 # A git pull can bring a newer source than the compiled binary, and nothing else
 # would notice. Rebuild into a temp file and swap only on success, so a broken
 # source never destroys a working binary. The lock stops sixteen panes racing.
@@ -211,6 +237,11 @@ on run argv
 end run
 APPLESCRIPT
   fi
+fi
+
+if [[ $hud_suppressed == 1 ]]; then
+  disown 2>/dev/null || true
+  exit 0
 fi
 
 "$HUD" \

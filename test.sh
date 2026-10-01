@@ -79,16 +79,63 @@ if [[ $onscreen == 111 ]]; then
     front=$(swaymsg -t get_tree 2>/dev/null \
       | jq -r '.. | select(.focused? == true) | .app_id // empty' | head -1)
   fi
-  args=$(run "$(payload Stop)" CLAUDE_TERMINAL_APP="$front")
+  args=$(run "$(payload Stop)" CLAUDE_TERMINAL_APP="$front" CLAUDE_NOTIFY_SKIP_FULLSCREEN=0)
   if [[ -z $front ]]; then
     note "skipped: no frontmost-window query on this compositor"
   else
   [[ -z $args ]] && ok "silent while you watch the pane" || bad "silent while you watch the pane" "rendered anyway"
-  args=$(run "$(payload Stop)" CLAUDE_TERMINAL_APP=NoSuchApp)
+  args=$(run "$(payload Stop)" CLAUDE_TERMINAL_APP=NoSuchApp CLAUDE_NOTIFY_SKIP_FULLSCREEN=0)
   [[ -n $args ]] && ok "renders when you are elsewhere" || bad "renders when you are elsewhere" "stayed silent"
   fi
 else
   note "skipped: this pane is not on screen in an attached session"
+fi
+
+echo "fullscreen"
+# A stub compositor rather than the real one: the suite must assert the same thing
+# whether or not anything happens to be fullscreen while it runs.
+fake=$tmp/fake; mkdir -p "$fake"
+hypr_stub() {                  # hypr_stub <fullscreen-mode>
+  cat > "$fake/hyprctl" <<STUB
+#!/usr/bin/env bash
+echo '{"class":"someapp","fullscreen":$1}'
+STUB
+  chmod +x "$fake/hyprctl"
+}
+if [[ $(uname) == Linux ]]; then
+  hypr_stub 2
+  args=$(run "$(payload Stop)" PATH="$fake:$PATH" CLAUDE_NOTIFY_NATIVE=0)
+  [[ -z $args ]] && ok "a fullscreen window suppresses the card" \
+                 || bad "a fullscreen window suppresses the card" "rendered anyway"
+
+  # The banner is the whole point of suppressing rather than exiting early: the turn
+  # still has to be waiting for you when you tab out of the game.
+  out=$(printf '%s' "$(payload Stop)" \
+    | env PATH="$fake:$PATH" CLAUDE_NOTIFY_DEBUG=1 "$here/notify-stop" 2>&1 >/dev/null)
+  check "and still records it in a banner"    "$out" "banner=["
+  check "saying why it went quiet"            "$out" "focused window is fullscreen"
+
+  hypr_stub 1
+  args=$(run "$(payload Stop)" PATH="$fake:$PATH" CLAUDE_NOTIFY_NATIVE=0)
+  [[ -n $args ]] && ok "a merely maximized window does not" \
+                 || bad "a merely maximized window does not" "stayed silent"
+
+  hypr_stub 3                  # maximized|fullscreen, the bitmask case
+  args=$(run "$(payload Stop)" PATH="$fake:$PATH" CLAUDE_NOTIFY_NATIVE=0)
+  [[ -z $args ]] && ok "maximized|fullscreen still counts as fullscreen" \
+                 || bad "maximized|fullscreen still counts as fullscreen" "rendered anyway"
+
+  hypr_stub 2
+  args=$(run "$(payload Stop)" PATH="$fake:$PATH" CLAUDE_NOTIFY_NATIVE=0 CLAUDE_NOTIFY_ALWAYS=1)
+  [[ -n $args ]] && ok "CLAUDE_NOTIFY_ALWAYS overrides it" \
+                 || bad "CLAUDE_NOTIFY_ALWAYS overrides it" "stayed silent"
+
+  args=$(run "$(payload Stop)" PATH="$fake:$PATH" CLAUDE_NOTIFY_NATIVE=0 CLAUDE_NOTIFY_SKIP_FULLSCREEN=0)
+  [[ -n $args ]] && ok "CLAUDE_NOTIFY_SKIP_FULLSCREEN=0 turns it off" \
+                 || bad "CLAUDE_NOTIFY_SKIP_FULLSCREEN=0 turns it off" "stayed silent"
+  rm -f "$fake/hyprctl"
+else
+  note "skipped: fullscreen suppression has no macOS probe yet"
 fi
 
 echo "hud binary"

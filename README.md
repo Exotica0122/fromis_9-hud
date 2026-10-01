@@ -236,6 +236,21 @@ attached session, the terminal is frontmost, and the screen is not locked. "Fron
 "locked" is the `CGSSessionScreenIsLocked` key on macOS and a running `hyprlock`/`swaylock`
 or `loginctl`'s `LockedHint` on Linux. Set `CLAUDE_NOTIFY_ALWAYS=1` to notify regardless.
 
+On Linux it also stays quiet while the focused window is **fullscreen** — a game, a film,
+a presentation. The HUD draws on the `overlay` layer, which the compositor puts *above*
+fullscreen windows, so without this it lands in the middle of the playfield. The card and
+its chime are skipped, but the banner still goes out, so the turn is waiting in your
+notification history when you tab back out.
+
+The test is the focused window only: a fullscreen game parked on another workspace while
+you work in the terminal does not suppress anything. Hyprland reports the state as a
+bitmask, and only true fullscreen counts — a merely maximized window is still a window,
+and the HUD belongs over it. `CLAUDE_NOTIFY_SKIP_FULLSCREEN=0` turns the rule off;
+`CLAUDE_NOTIFY_ALWAYS=1` overrides it along with the watching-the-pane check.
+
+There is no macOS equivalent yet: detecting a fullscreen Space from a shell needs
+accessibility permission, which is a worse trade than the feature is worth.
+
 On Linux, `gtk4-layer-shell` has to interpose `libwayland-client` before GTK opens the
 display, which a Python process cannot arrange after import. `claude-hud-gtk` therefore
 re-execs itself once with `LD_PRELOAD` set — it finds the library itself, so there is
@@ -278,6 +293,7 @@ CLAUDE_NOTIFY_SECONDS=8       # how long the HUD holds
 CLAUDE_NOTIFY_MEMBER=jiwon    # pin a member instead of picking at random
 CLAUDE_NOTIFY_ACCENT='#f59e0b'
 CLAUDE_NOTIFY_NATIVE=0        # skip the persistent banner
+CLAUDE_NOTIFY_SKIP_FULLSCREEN=0   # Linux: show the HUD even over a fullscreen window
 CLAUDE_TERMINAL_APP=Ghostty   # which app focus-pane raises
 CLAUDE_HUD_PORTRAITS=~/pics   # where portraits and their config live
 ```
