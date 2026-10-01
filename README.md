@@ -233,8 +233,9 @@ never costs a notification.
 The hook stays silent when you are already looking at the pane — it is on screen in an
 attached session, the terminal is frontmost, and the screen is not locked. "Frontmost" is
 `lsappinfo` on macOS and `hyprctl activewindow` or `swaymsg -t get_tree` on Linux;
-"locked" is the `CGSSessionScreenIsLocked` key on macOS and a running `hyprlock`/`swaylock`
-or `loginctl`'s `LockedHint` on Linux. Set `CLAUDE_NOTIFY_ALWAYS=1` to notify regardless.
+"locked" is the `CGSSessionScreenIsLocked` key on macOS and a running `hyprlock`/`swaylock`,
+the Omarchy shell's own lock (`omarchy-shell lock isLocked`) or `loginctl`'s `LockedHint`
+on Linux. Set `CLAUDE_NOTIFY_ALWAYS=1` to notify regardless.
 
 On Linux two further rules keep notifications out of your way, and they differ in kind:
 one *defers* the turn, the other merely *drops the card*.
@@ -253,9 +254,12 @@ belongs over it.
 **Your notification daemon in do-not-disturb — card dropped, banner kept.** The daemon is
 already deciding what to show and what to file away, so the banner is handed to it as
 usual and only the card, which it does not control, is skipped. On Omarchy that toggle is
-already bound: `omarchy-toggle-notification-silencing` flips mako's `do-not-disturb` mode.
-`makoctl`, `dunstctl is-paused` and `swaync-client --get-dnd` are all understood. mako
-modes are arbitrary strings, so `CLAUDE_NOTIFY_DND_MODE` sets which one to match.
+already bound: `omarchy-toggle-notification-silencing` flips the Omarchy shell's own
+do-not-disturb from version 4, and mako's `do-not-disturb` mode before that.
+`omarchy-shell notifications isDnd`, `makoctl`, `dunstctl is-paused` and
+`swaync-client --get-dnd` are all understood, and every one that is installed is asked, so
+a daemon left behind by an upgrade cannot hide the one that is running. mako modes are
+arbitrary strings, so `CLAUDE_NOTIFY_DND_MODE` sets which one to match.
 
 ### The replay
 

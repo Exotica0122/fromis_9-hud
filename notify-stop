@@ -48,17 +48,21 @@ focused_fullscreen() {
 
 in_do_not_disturb() {
   [[ $os == linux ]] || return 1
-  if command -v makoctl >/dev/null 2>&1; then
-    # mako modes are arbitrary user strings; do-not-disturb is the convention, and
-    # what omarchy-toggle-notification-silencing flips.
-    makoctl mode 2>/dev/null | grep -qxF "${CLAUDE_NOTIFY_DND_MODE:-do-not-disturb}"
-  elif command -v dunstctl >/dev/null 2>&1; then
-    [[ $(dunstctl is-paused 2>/dev/null) == true ]]
-  elif command -v swaync-client >/dev/null 2>&1; then
-    [[ $(swaync-client --get-dnd 2>/dev/null) == true ]]
-  else
-    return 1
+  # Every installed daemon is asked: a leftover binary must not hide the running one.
+  if command -v omarchy-shell >/dev/null 2>&1; then
+    [[ $(omarchy-shell notifications isDnd 2>/dev/null) == on ]] && return 0
   fi
+  if command -v makoctl >/dev/null 2>&1; then
+    # mako modes are arbitrary user strings; do-not-disturb is the convention.
+    makoctl mode 2>/dev/null | grep -qxF "${CLAUDE_NOTIFY_DND_MODE:-do-not-disturb}" && return 0
+  fi
+  if command -v dunstctl >/dev/null 2>&1; then
+    [[ $(dunstctl is-paused 2>/dev/null) == true ]] && return 0
+  fi
+  if command -v swaync-client >/dev/null 2>&1; then
+    [[ $(swaync-client --get-dnd 2>/dev/null) == true ]] && return 0
+  fi
+  return 1
 }
 
 # The one question the watcher keeps re-asking: is now still a bad time?
@@ -238,6 +242,7 @@ if [[ ${CLAUDE_NOTIFY_ALWAYS:-0} != 1 && -n ${TMUX_PANE:-} ]]; then
       locked=0
       pgrep -x hyprlock >/dev/null 2>&1 && locked=1
       pgrep -x swaylock >/dev/null 2>&1 && locked=1
+      [[ $(omarchy-shell lock isLocked 2>/dev/null) == true ]] && locked=1
       [[ $(loginctl show-session "${XDG_SESSION_ID:-}" -p LockedHint --value 2>/dev/null) == yes ]] && locked=1
       terminal=${CLAUDE_TERMINAL_APP:-com.mitchellh.ghostty}
     fi

@@ -111,6 +111,16 @@ exit 0
 STUB
   chmod +x "$fake/makoctl"
 }
+omarchy_stub() {               # omarchy_stub <on|off> <true|false>
+  cat > "$fake/omarchy-shell" <<STUB
+#!/usr/bin/env bash
+case "\$1 \$2" in
+  "notifications isDnd") echo '$1' ;;
+  "lock isLocked")       echo '$2' ;;
+esac
+STUB
+  chmod +x "$fake/omarchy-shell"
+}
 # The shared stub truncates; replaying a batch needs every call kept.
 cat > "$tmp/stub-many" <<'STUB'
 #!/usr/bin/env bash
@@ -131,6 +141,7 @@ if [[ $(uname) == Linux ]]; then
   # that case would read the stale card as its own.
   drain() { : > "$queue"; }
   mako_stub default
+  omarchy_stub off false
 
   hypr_stub 2
   args=$(run "$(payload Stop)" "${defer_env[@]}")
@@ -204,7 +215,7 @@ if [[ $(uname) == Linux ]]; then
                       || bad "one chime for the batch, not one per turn" "$chimes cards would chime"
   [[ ! -s $rq ]] && ok "the queue is drained" \
                  || bad "the queue is drained" "$(wc -l <"$rq") left behind"
-  rm -f "$fake/hyprctl" "$fake/makoctl" "$queue" "$rq"
+  rm -f "$fake/hyprctl" "$fake/makoctl" "$fake/omarchy-shell" "$queue" "$rq"
   rmdir "$queue.lock" "$rq.lock" 2>/dev/null       # mkdir is the lock, so rm -f will not do
 else
   note "skipped: deferral has no macOS probe yet"
@@ -213,6 +224,7 @@ fi
 echo "do-not-disturb"
 if [[ $(uname) == Linux ]]; then
   hypr_stub 0                  # pin the other rule off, so this one is what is tested
+  omarchy_stub off false
   mako_stub do-not-disturb
   args=$(run "$(payload Stop)" PATH="$fake:$PATH" CLAUDE_NOTIFY_NATIVE=0)
   [[ -z $args ]] && ok "do-not-disturb suppresses the card" \
@@ -246,7 +258,34 @@ if [[ $(uname) == Linux ]]; then
   [[ -z $args ]] && ok "CLAUDE_NOTIFY_DND_MODE matches a custom mode" \
                  || bad "CLAUDE_NOTIFY_DND_MODE matches a custom mode" "rendered anyway"
 
-  rm -f "$fake/hyprctl" "$fake/makoctl"
+  mako_stub default
+  omarchy_stub on false
+  args=$(run "$(payload Stop)" PATH="$fake:$PATH" CLAUDE_NOTIFY_NATIVE=0)
+  [[ -z $args ]] && ok "the Omarchy shell's do-not-disturb suppresses the card" \
+                 || bad "the Omarchy shell's do-not-disturb suppresses the card" "rendered anyway"
+  omarchy_stub off false
+  args=$(run "$(payload Stop)" PATH="$fake:$PATH" CLAUDE_NOTIFY_NATIVE=0)
+  [[ -n $args ]] && ok "and its off state does not" \
+                 || bad "and its off state does not" "stayed silent"
+
+  echo "a locked screen is not watching"
+  watch=$tmp/watch; mkdir -p "$watch"
+  cat > "$watch/tmux" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in *pane_active*) echo "1 1 1" ;; *) echo "test:1.1" ;; esac
+STUB
+  chmod +x "$watch/tmux"
+  watch_env=(PATH="$watch:$fake:$PATH" TMUX_PANE=%0 CLAUDE_TERMINAL_APP=someapp
+             CLAUDE_NOTIFY_NATIVE=0)
+  args=$(run "$(payload Stop)" "${watch_env[@]}")
+  [[ -z $args ]] && ok "an unlocked Omarchy shell stays silent on the watched pane" \
+                 || bad "an unlocked Omarchy shell stays silent on the watched pane" "rendered anyway"
+  omarchy_stub off true
+  args=$(run "$(payload Stop)" "${watch_env[@]}")
+  [[ -n $args ]] && ok "a locked Omarchy shell still notifies" \
+                 || bad "a locked Omarchy shell still notifies" "stayed silent"
+
+  rm -f "$fake/hyprctl" "$fake/makoctl" "$fake/omarchy-shell"
 else
   note "skipped: no macOS do-not-disturb probe"
 fi
