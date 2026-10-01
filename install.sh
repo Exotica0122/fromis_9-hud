@@ -17,19 +17,63 @@ need() {
   fi
 }
 
-say "checking dependencies"
-[[ $(uname) == Darwin ]] || { say "  MISSING  macOS — this HUD is AppKit-only"; exit 1; }
-need swiftc "xcode-select --install"
-need jq "brew install jq"
-need tmux "brew install tmux (optional: enables the pane address and click-to-focus)"
-command -v terminal-notifier >/dev/null 2>&1 \
-  && say "  ok       terminal-notifier" \
-  || say "  absent   terminal-notifier — optional; without it the Notification Center banner falls back to osascript and is not clickable"
+case $(uname) in
+  Darwin) os=mac ;;
+  Linux)  os=linux ;;
+  *)      say "unsupported platform: $(uname)"; exit 1 ;;
+esac
+
+say "checking dependencies ($os)"
+need jq "$([[ $os == mac ]] && echo 'brew install jq' || echo 'your package manager')"
+need tmux "optional: enables the pane address and click-to-focus"
+
+if [[ $os == mac ]]; then
+  need swiftc "xcode-select --install"
+  command -v terminal-notifier >/dev/null 2>&1 \
+    && say "  ok       terminal-notifier" \
+    || say "  absent   terminal-notifier — optional; without it the Notification Center banner falls back to osascript and is not clickable"
+else
+  need python3 "your package manager"
+  # The GTK stack is checked by importing it, not by looking for package names:
+  # the names differ per distro and an import is what actually has to succeed.
+  if python3 -c 'import gi, cairo
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gtk4LayerShell", "1.0")
+from gi.repository import Gtk, Gtk4LayerShell' >/dev/null 2>&1; then
+    say "  ok       gtk4 + gtk4-layer-shell + pygobject + pycairo"
+  else
+    say "  MISSING  gtk4 / gtk4-layer-shell / python-gobject / python-cairo"
+    say "           Arch:   sudo pacman -S gtk4 gtk4-layer-shell python-gobject python-cairo"
+    say "           Fedora: sudo dnf install gtk4 gtk4-layer-shell python3-gobject python3-cairo"
+    say "           Debian: sudo apt install libgtk-4-1 libgtk4-layer-shell0 python3-gi python3-cairo"
+    ok=0
+  fi
+  command -v notify-send >/dev/null 2>&1 \
+    && say "  ok       notify-send" \
+    || say "  absent   notify-send — optional; without it there is no persistent banner, only the HUD"
+  # The HUD is a layer-shell surface, which is a Wayland protocol. X11 cannot host it.
+  if [[ ${XDG_SESSION_TYPE:-} == wayland || -n ${WAYLAND_DISPLAY:-} ]]; then
+    say "  ok       wayland session"
+  else
+    say "  MISSING  a Wayland session — the HUD draws on zwlr_layer_shell_v1"
+    ok=0
+  fi
+fi
 [[ $ok == 1 ]] || { say "install aborted"; exit 1; }
 
-say "building claude-hud"
-swiftc -O -o "$here/bin/claude-hud" "$here/bin/claude-hud.swift"
-chmod +x "$here/notify-stop" "$here/focus-pane" "$here/bin/claude-hud"
+if [[ $os == mac ]]; then
+  say "building claude-hud"
+  swiftc -O -o "$here/bin/claude-hud" "$here/bin/claude-hud.swift"
+  chmod +x "$here/bin/claude-hud"
+  hud=$here/bin/claude-hud
+else
+  say "checking claude-hud-gtk"
+  python3 -c "import ast, sys; ast.parse(open(sys.argv[1]).read())" "$here/bin/claude-hud-gtk" \
+    || { say "  MISSING  bin/claude-hud-gtk does not parse"; exit 1; }
+  say "  ok       nothing to compile — the Linux backend is a script"
+  hud=$here/bin/claude-hud-gtk
+fi
+chmod +x "$here/notify-stop" "$here/focus-pane" "$hud"
 
 say "portraits"
 mkdir -p "$portraits"
@@ -83,7 +127,7 @@ link() {                       # link <target> <link-path>
 link "$here" "$HOME/.claude/fromis_9-hud"
 
 say "smoke test"
-"$here/bin/claude-hud" --preview "${TMPDIR:-/tmp}/fromis_9-hud-smoke.png" \
+"$hud" --preview "${TMPDIR:-/tmp}/fromis_9-hud-smoke.png" \
   --title "install check" --badge "session:1.1" --repo repo --branch main \
   --body "If you can read this, the build works." >/dev/null
 say "  ok       rendered ${TMPDIR:-/tmp}/fromis_9-hud-smoke.png"
@@ -107,6 +151,16 @@ $settings — it is your file and this script will not edit it:
 
 $(cat "$here/hooks.example.json")
 SNIPPET
+fi
+
+if [[ $os == linux ]]; then
+  cat <<'LINUX'
+
+note: the HUD needs gtk4-layer-shell loaded before GTK opens the display, so
+claude-hud-gtk re-execs itself once with LD_PRELOAD set. Nothing to configure —
+it finds the library itself — but it is why the process list shows python3, not
+the script name.
+LINUX
 fi
 
 cat <<EOS

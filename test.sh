@@ -6,6 +6,10 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 pass=0; fail=0
 
+# Whichever backend this platform actually uses; they take the same flags.
+if [[ $(uname) == Linux ]]; then HUD=$here/bin/claude-hud-gtk
+else HUD=$here/bin/claude-hud; fi
+
 ok()   { printf '  ok    %s\n' "$1"; pass=$((pass+1)); }
 bad()  { printf '  FAIL  %s\n     %s\n' "$1" "$2"; fail=$((fail+1)); }
 note() { printf '  --    %s\n' "$1"; }
@@ -59,23 +63,40 @@ absent "banner withholds the message body"    "$out" "banner=[Turn complete"
 check  "banner still names the session"       "$out" "banner=[Finished"
 
 echo "skip when you are watching"
+# session_attached matters as much as the two active flags: in a detached session
+# nobody is watching the pane, so notify-stop is right to render and the check
+# would fail for the wrong reason.
 onscreen=$([[ -n ${TMUX_PANE:-} ]] \
-  && tmux display-message -p -t "$TMUX_PANE" '#{pane_active}#{window_active}' 2>/dev/null)
-if [[ $onscreen == 11 ]]; then
-  front=$(lsappinfo info -only name "$(lsappinfo front 2>/dev/null)" 2>/dev/null \
-    | sed -E 's/.*"LSDisplayName"="([^"]*)".*/\1/')
+  && tmux display-message -p -t "$TMUX_PANE" \
+       '#{pane_active}#{window_active}#{?session_attached,1,0}' 2>/dev/null)
+if [[ $onscreen == 111 ]]; then
+  if [[ $(uname) == Darwin ]]; then
+    front=$(lsappinfo info -only name "$(lsappinfo front 2>/dev/null)" 2>/dev/null \
+      | sed -E 's/.*"LSDisplayName"="([^"]*)".*/\1/')
+  elif command -v hyprctl >/dev/null 2>&1; then
+    front=$(hyprctl activewindow -j 2>/dev/null | jq -r '.class // empty')
+  elif command -v swaymsg >/dev/null 2>&1; then
+    front=$(swaymsg -t get_tree 2>/dev/null \
+      | jq -r '.. | select(.focused? == true) | .app_id // empty' | head -1)
+  fi
   args=$(run "$(payload Stop)" CLAUDE_TERMINAL_APP="$front")
+  if [[ -z $front ]]; then
+    note "skipped: no frontmost-window query on this compositor"
+  else
   [[ -z $args ]] && ok "silent while you watch the pane" || bad "silent while you watch the pane" "rendered anyway"
   args=$(run "$(payload Stop)" CLAUDE_TERMINAL_APP=NoSuchApp)
   [[ -n $args ]] && ok "renders when you are elsewhere" || bad "renders when you are elsewhere" "stayed silent"
+  fi
 else
-  note "skipped: this pane is not on screen, so the check cannot be exercised"
+  note "skipped: this pane is not on screen in an attached session"
 fi
 
 echo "hud binary"
-"$here/bin/claude-hud" --preview "$tmp/p.png" --title t --body b >/dev/null 2>&1
+"$HUD" --preview "$tmp/p.png" --title t --body b >/dev/null 2>&1
 [[ -s $tmp/p.png ]] && ok "renders a card offscreen" || bad "renders a card offscreen" "no png produced"
-if command -v swiftc >/dev/null 2>&1; then
+# Only the Swift backend is compiled, so only it can go stale. stat -f is BSD-only,
+# which is fine: this whole block is macOS.
+if [[ $(uname) == Darwin ]] && command -v swiftc >/dev/null 2>&1; then
   # Backdate the binary rather than touching the source: /bin/bash 3.2, which CI uses,
   # compares -nt at whole-second granularity, so a same-second touch does not read as newer.
   touch -t 202001010000 "$here/bin/claude-hud"
@@ -108,7 +129,7 @@ absent "no leftover ~/.claude/hooks path"        "$args" ".claude/hooks"
 conf=$tmp/portraits; mkdir -p "$conf"
 printf '%s\n' '# <slug> <display name> <rail hex>' 'solo Solo One 00FF00' >"$conf/roster.conf"
 render() {                     # render <out> <portraits-dir>
-  CLAUDE_HUD_PORTRAITS=$2 "$here/bin/claude-hud" --preview "$1" --member solo \
+  CLAUDE_HUD_PORTRAITS=$2 "$HUD" --preview "$1" --member solo \
     --avatar none --sound none --title t --body b >/dev/null 2>&1
 }
 render "$tmp/roster.png" "$conf"
@@ -126,17 +147,18 @@ echo "portrait lookup"
 # Two distinct, definitely-valid images, rendered by the HUD itself.
 # They must differ in the middle of the frame: the avatar crop is centred, so images
 # differing only at an edge (an accent rail, say) survive the crop looking identical.
-"$here/bin/claude-hud" --preview "$tmp/A.png" --avatar none --sound none \
+"$HUD" --preview "$tmp/A.png" --avatar none --sound none \
   --title "XXXXXXXXXXXXXXXXXXXX" --body "$(printf 'X%.0s' {1..120})" >/dev/null 2>&1
-"$here/bin/claude-hud" --preview "$tmp/B.png" --avatar none --sound none \
+"$HUD" --preview "$tmp/B.png" --avatar none --sound none \
   --title "oooooooooooooooooooo" --body "$(printf 'o%.0s' {1..120})" >/dev/null 2>&1
 pri=$tmp/primary; mkdir -p "$pri" "$here/portraits"
 printf 'solo Solo One 00FF00\n' >"$pri/roster.conf"
 cp "$tmp/A.png" "$pri/solo.png"
-# .webp by name, PNG by content — NSImage sniffs the bytes, and the point here is that a
-# lower-priority directory holds the extension the lookup would otherwise prefer.
+# .webp by name, PNG by content — both NSImage and GdkPixbuf sniff the bytes, and the
+# point here is that a lower-priority directory holds the extension the lookup would
+# otherwise prefer.
 cp "$tmp/B.png" "$here/portraits/solo.webp"
-shot() { CLAUDE_HUD_PORTRAITS=$pri "$here/bin/claude-hud" --preview "$1" --member solo \
+shot() { CLAUDE_HUD_PORTRAITS=$pri "$HUD" --preview "$1" --member solo \
   --sound none --title t --body b >/dev/null 2>&1; }
 shot "$tmp/both.png"
 rm -f "$here/portraits/solo.webp"
