@@ -236,29 +236,50 @@ attached session, the terminal is frontmost, and the screen is not locked. "Fron
 "locked" is the `CGSSessionScreenIsLocked` key on macOS and a running `hyprlock`/`swaylock`
 or `loginctl`'s `LockedHint` on Linux. Set `CLAUDE_NOTIFY_ALWAYS=1` to notify regardless.
 
-On Linux two further rules keep the card out of the way. Both skip the card *and its
-chime* but still post the banner, so the turn is waiting in your notification history
-when you come back — suppressed, not discarded.
+On Linux two further rules keep notifications out of your way, and they differ in kind:
+one *defers* the turn, the other merely *drops the card*.
 
-**A fullscreen focused window** — a game, a film, a presentation. The HUD draws on the
-`overlay` layer, which the compositor puts *above* fullscreen windows, so without this it
-lands in the middle of the playfield. Only the focused window counts: a fullscreen game
-parked on another workspace while you work in the terminal suppresses nothing. Hyprland
-reports the state as a bitmask and only the fullscreen bit qualifies — a merely maximized
-window is still a window, and the HUD belongs over it.
+**A fullscreen focused window — deferred.** A game, a film, a presentation. Nothing is
+shown at the time: no card, no banner, no chime. The turn is queued, and replayed the
+moment the screen is yours again. Dropping only the card would not have helped, because
+mako draws on the `overlay` layer too, so its banner lands over the game exactly as the
+card did.
 
-**Your notification daemon in do-not-disturb** — the HUD is a notification too, and a
-louder one than the banner, so one toggle should silence both. On Omarchy that toggle is
+Only the focused window counts: a fullscreen game parked on another workspace while you
+work in the terminal defers nothing. Hyprland reports the state as a bitmask and only the
+fullscreen bit qualifies — a merely maximized window is still a window, and the HUD
+belongs over it.
+
+**Your notification daemon in do-not-disturb — card dropped, banner kept.** The daemon is
+already deciding what to show and what to file away, so the banner is handed to it as
+usual and only the card, which it does not control, is skipped. On Omarchy that toggle is
 already bound: `omarchy-toggle-notification-silencing` flips mako's `do-not-disturb` mode.
 `makoctl`, `dunstctl is-paused` and `swaync-client --get-dnd` are all understood. mako
-modes are arbitrary strings, so `CLAUDE_NOTIFY_DND_MODE` sets which one to match if you
-do not call yours `do-not-disturb`.
+modes are arbitrary strings, so `CLAUDE_NOTIFY_DND_MODE` sets which one to match.
+
+### The replay
+
+Deferring spawns a watcher — `notify-stop --flush-watch`, one at a time, held by a
+`mkdir` lock so sixteen panes finishing mid-game still leave exactly one. It polls until
+the screen is free, then replays everything that piled up, oldest first, so the newest
+turn ends up on top of the stack. The rest peek beneath it and fan out on hover, which is
+what the stack was built for.
+
+Each replayed card keeps its own pane address, so clicking any of them still jumps to the
+right pane. Only one card chimes, not one per turn you missed. The queue is capped, oldest
+dropped first, so a long session cannot replay an unbounded stack.
+
+The queue lives in `XDG_RUNTIME_DIR`, so it does not survive a logout — a turn deferred
+yesterday is not worth showing today.
 
 | Variable | Effect |
 |---|---|
-| `CLAUDE_NOTIFY_SKIP_FULLSCREEN=0` | show the HUD over fullscreen windows anyway |
+| `CLAUDE_NOTIFY_SKIP_FULLSCREEN=0` | never defer; show the HUD over fullscreen windows |
 | `CLAUDE_NOTIFY_SKIP_DND=0` | ignore the notification daemon's mode |
 | `CLAUDE_NOTIFY_DND_MODE=<name>` | the mako mode that counts as do-not-disturb |
+| `CLAUDE_NOTIFY_DEFER_POLL=3` | seconds between "is the screen free yet?" checks |
+| `CLAUDE_NOTIFY_DEFER_MAX=20` | how many turns the queue holds before dropping the oldest |
+| `CLAUDE_NOTIFY_DEFER_MAX_WAIT=86400` | give up waiting and replay anyway, after this long |
 | `CLAUDE_NOTIFY_ALWAYS=1` | override all of this, and the watching-the-pane check |
 
 Neither rule has a macOS counterpart. Reading a fullscreen Space or a Focus mode from a
@@ -275,7 +296,7 @@ script's name.
 
 | File | Purpose |
 |---|---|
-| `notify-stop` | the Stop/Notification hook: builds the notification from the transcript |
+| `notify-stop` | the Stop/Notification hook: builds the notification from the transcript. `--flush-watch` runs the deferred-turn watcher |
 | `bin/claude-hud.swift` | the macOS HUD (AppKit) |
 | `bin/claude-hud-gtk` | the Linux HUD (GTK4 on a layer-shell surface) |
 | `focus-pane` | jumps to a tmux pane and raises the terminal |
@@ -310,6 +331,7 @@ CLAUDE_NOTIFY_NATIVE=0        # skip the persistent banner
 CLAUDE_NOTIFY_SKIP_FULLSCREEN=0   # Linux: show the HUD even over a fullscreen window
 CLAUDE_NOTIFY_SKIP_DND=0      # Linux: show the HUD even in do-not-disturb
 CLAUDE_NOTIFY_DND_MODE=quiet  # the mako mode that counts as do-not-disturb
+CLAUDE_NOTIFY_DEFER_POLL=3    # how often the replay watcher checks the screen
 CLAUDE_TERMINAL_APP=Ghostty   # which app focus-pane raises
 CLAUDE_HUD_PORTRAITS=~/pics   # where portraits and their config live
 ```

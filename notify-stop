@@ -25,6 +25,164 @@ VOLUME=${CLAUDE_NOTIFY_VOLUME:-1.0}
 JQ=$(command -v jq || echo /opt/homebrew/bin/jq)
 [[ -x $JQ ]] || exit 0
 
+RUNTIME=${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}
+# Overridable so the suite gets its own queue instead of racing a live one.
+QUEUE=${CLAUDE_NOTIFY_DEFER_QUEUE:-$RUNTIME/claude-hud-deferred.jsonl}
+LOCK=$QUEUE.lock
+
+# Is the window you are looking at covering the screen? Hyprland answers with a
+# bitmask: 1 maximized, 2 fullscreen, 3 both. Only the fullscreen bit counts — a
+# maximized window is still a window, and the HUD belongs over it.
+focused_fullscreen() {
+  [[ $os == linux ]] || return 1
+  local fsmode=0
+  if command -v hyprctl >/dev/null 2>&1; then
+    fsmode=$("$JQ" -r '.fullscreen // 0' <<<"$(hyprctl activewindow -j 2>/dev/null)" 2>/dev/null)
+  elif command -v swaymsg >/dev/null 2>&1; then
+    swaymsg -t get_tree 2>/dev/null \
+      | "$JQ" -e 'first(.. | select(.focused? == true) | select((.fullscreen_mode? // 0) > 0))' \
+        >/dev/null 2>&1 && fsmode=2
+  fi
+  [[ ${fsmode:-0} =~ ^[0-9]+$ ]] && (( fsmode & 2 ))
+}
+
+in_do_not_disturb() {
+  [[ $os == linux ]] || return 1
+  if command -v makoctl >/dev/null 2>&1; then
+    # mako modes are arbitrary user strings; do-not-disturb is the convention, and
+    # what omarchy-toggle-notification-silencing flips.
+    makoctl mode 2>/dev/null | grep -qxF "${CLAUDE_NOTIFY_DND_MODE:-do-not-disturb}"
+  elif command -v dunstctl >/dev/null 2>&1; then
+    [[ $(dunstctl is-paused 2>/dev/null) == true ]]
+  elif command -v swaync-client >/dev/null 2>&1; then
+    [[ $(swaync-client --get-dnd 2>/dev/null) == true ]]
+  else
+    return 1
+  fi
+}
+
+# The one question the watcher keeps re-asking: is now still a bad time?
+should_defer() {
+  [[ ${CLAUDE_NOTIFY_ALWAYS:-0} == 1 ]] && return 1
+  [[ ${CLAUDE_NOTIFY_SKIP_FULLSCREEN:-1} == 1 ]] || return 1
+  focused_fullscreen
+}
+
+emit_hud() {                   # emit_hud <hud args...>
+  [[ -x $HUD ]] || return 0
+  "$HUD" "$@" >/dev/null 2>&1 &
+  # Detached: the hook must not sit for the HUD's whole display time. Its 10s
+  # timeout would otherwise cut a 12s blocked notification short.
+  disown 2>/dev/null || true
+}
+
+emit_banner() {                # emit_banner <headline> <subtitle> <body> <group> <event> <pane>
+  [[ ${CLAUDE_NOTIFY_NATIVE:-1} == 1 ]] || return 0
+  local headline=$1 subtitle=$2 text=$3 group=$4 ev=$5 pane=$6
+  [[ ${CLAUDE_NOTIFY_DEBUG:-0} == 1 ]] && echo "notify-stop: banner=[$text]" >&2
+  local NOTIFIER; NOTIFIER=$(command -v terminal-notifier || true)
+  local args=()
+  if [[ $os == linux ]] && command -v notify-send >/dev/null 2>&1; then
+    # x-canonical-private-synchronous is the freedesktop counterpart of
+    # terminal-notifier's -group: a second banner for the same pane replaces the
+    # first instead of stacking another copy in the tray.
+    args=(-a "Claude Code"
+          -u "$([[ $ev == Notification ]] && echo critical || echo normal)"
+          -h "string:x-canonical-private-synchronous:$group"
+          -h "string:desktop-entry:claude-code")
+    [[ -n ${CLAUDE_NOTIFY_ICON:-} ]] && args+=(-i "$CLAUDE_NOTIFY_ICON")
+    if [[ -n $pane ]]; then
+      # --wait blocks for the life of the banner and then prints the key of
+      # whatever was pressed, so the whole thing is detached and acts afterwards.
+      (
+        chosen=$(notify-send "${args[@]}" -A "focus=Open ${group#claude-code-}" --wait \
+                   "$headline" "$subtitle"$'\n'"$text" 2>/dev/null)
+        [[ $chosen == focus ]] && "$here/focus-pane" "$pane" "$group"
+      ) >/dev/null 2>&1 &
+    else
+      notify-send "${args[@]}" "$headline" "$subtitle"$'\n'"$text" >/dev/null 2>&1 &
+    fi
+  elif [[ -n $NOTIFIER ]]; then
+    # terminal-notifier can run a command on click; osascript cannot.
+    args=(-title "$headline" -subtitle "$subtitle" -message "$text" -group "$group")
+    [[ -n $pane ]] && args+=(-execute "$here/focus-pane $pane $group")
+    [[ -n ${CLAUDE_NOTIFY_NATIVE_SOUND:-} ]] && args+=(-sound "$CLAUDE_NOTIFY_NATIVE_SOUND")
+    "$NOTIFIER" "${args[@]}" >/dev/null 2>&1 &
+  elif [[ $os == mac ]]; then
+    /usr/bin/osascript - "$headline" "$subtitle" "$text" >/dev/null 2>&1 <<'APPLESCRIPT' &
+on run argv
+  display notification (item 3 of argv) with title (item 1 of argv) subtitle (item 2 of argv)
+end run
+APPLESCRIPT
+  fi
+  disown 2>/dev/null || true
+}
+
+queue_push() {                 # queue_push <headline> <subtitle> <body> <group> <event> <pane> <hud args...>
+  local headline=$1 subtitle=$2 text=$3 group=$4 ev=$5 pane=$6; shift 6
+  mkdir -p "$(dirname "$QUEUE")" 2>/dev/null
+  # The -- matters: the card's own flags start with --title, which jq would
+  # otherwise try to parse as its own options.
+  "$JQ" -nc --arg h "$headline" --arg s "$subtitle" --arg t "$text" \
+        --arg g "$group" --arg e "$ev" --arg p "$pane" --args \
+        '{banner:{headline:$h,subtitle:$s,text:$t,group:$g,event:$e,pane:$p},hud:$ARGS.positional}' \
+        -- "$@" >>"$QUEUE" 2>/dev/null
+  # A long session should not replay an unbounded stack; drop the oldest.
+  local cap=${CLAUDE_NOTIFY_DEFER_MAX:-20}
+  if [[ $(wc -l <"$QUEUE" 2>/dev/null || echo 0) -gt $cap ]]; then
+    tail -n "$cap" "$QUEUE" >"$QUEUE.trim" 2>/dev/null && mv -f "$QUEUE.trim" "$QUEUE"
+  fi
+}
+
+flush_queue() {
+  local pending=$QUEUE.flushing
+  mv -f "$QUEUE" "$pending" 2>/dev/null || return 0
+  local first=1 line
+  # Oldest first, so the newest ends up on top of the stack.
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    local hud=() b=()
+    mapfile -t hud < <("$JQ" -r '.hud[]' <<<"$line" 2>/dev/null)
+    mapfile -t b < <("$JQ" -r '.banner | .headline, .subtitle, .text, .group, .event, .pane' \
+                       <<<"$line" 2>/dev/null)
+    [[ ${#hud[@]} -gt 0 ]] || continue
+    emit_banner "${b[0]-}" "${b[1]-}" "${b[2]-}" "${b[3]-}" "${b[4]-}" "${b[5]-}"
+    # One chime for the whole batch, not one per turn you missed.
+    [[ $first == 1 ]] && first=0 || hud+=(--sound none)
+    emit_hud "${hud[@]}"
+    sleep 0.15
+  done <"$pending"
+  rm -f "$pending"
+}
+
+# Spawned when a turn is deferred: waits for the screen to be yours again, then
+# replays everything that piled up. mkdir is the lock, so sixteen panes finishing
+# inside a game still leave exactly one watcher.
+watch_and_flush() {
+  mkdir "$LOCK" 2>/dev/null || return 0
+  trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+  local poll=${CLAUDE_NOTIFY_DEFER_POLL:-3}
+  local waited=0 limit=${CLAUDE_NOTIFY_DEFER_MAX_WAIT:-86400}
+  while (( waited < limit )); do
+    sleep "$poll"
+    waited=$(( waited + poll ))
+    [[ -s $QUEUE ]] || return 0
+    should_defer || { flush_queue; return 0; }
+  done
+  flush_queue                  # gave up waiting; late beats never
+}
+
+ensure_watcher() {
+  [[ -d $LOCK ]] && return 0
+  setsid "$here/notify-stop" --flush-watch >/dev/null 2>&1 </dev/null &
+  disown 2>/dev/null || true
+}
+
+if [[ ${1:-} == --flush-watch ]]; then
+  watch_and_flush
+  exit 0
+fi
+
 input=$(cat)
 transcript=$("$JQ" -r '.transcript_path // empty' <<<"$input" 2>/dev/null)
 cwd=$("$JQ" -r '.cwd // empty' <<<"$input" 2>/dev/null)
@@ -90,58 +248,32 @@ if [[ ${CLAUDE_NOTIFY_ALWAYS:-0} != 1 && -n ${TMUX_PANE:-} ]]; then
   fi
 fi
 
-# Two rules suppress the card and its chime but deliberately fall through to the
-# banner, so the turn is still recorded and waiting when you come back. Both are
-# Linux-only: macOS has no probe for either that does not want accessibility
-# permission. CLAUDE_NOTIFY_ALWAYS=1 overrides them, as it does the
-# watching-the-pane check.
+# Two ways a turn can be held back, both Linux-only — macOS has no probe for either
+# that does not want accessibility permission. CLAUDE_NOTIFY_ALWAYS=1 overrides
+# both, as it does the watching-the-pane check.
+#
+#   defer       nothing is shown now. The turn is queued and replayed when the
+#               screen is yours again. For a fullscreen window — a game, a film —
+#               where the banner is as unwelcome as the card: mako draws on the
+#               overlay layer too, so it lands over the game just the same.
+#   suppressed  the card and its chime go, the banner still posts. For
+#               do-not-disturb, where the daemon already decides what to show.
+defer_turn=0
 hud_suppressed=0
 suppress_reason=""
 
 if [[ ${CLAUDE_NOTIFY_ALWAYS:-0} != 1 && $os == linux ]]; then
-  # 1. A fullscreen window is a game, a film or a presentation, and the HUD draws on
-  #    the overlay layer — above fullscreen, right across the middle of it.
-  if [[ ${CLAUDE_NOTIFY_SKIP_FULLSCREEN:-1} == 1 ]]; then
-    fsmode=0
-    if command -v hyprctl >/dev/null 2>&1; then
-      fsmode=$("$JQ" -r '.fullscreen // 0' <<<"$(hyprctl activewindow -j 2>/dev/null)" 2>/dev/null)
-    elif command -v swaymsg >/dev/null 2>&1; then
-      swaymsg -t get_tree 2>/dev/null \
-        | "$JQ" -e 'first(.. | select(.focused? == true) | select((.fullscreen_mode? // 0) > 0))' \
-          >/dev/null 2>&1 && fsmode=2
-    fi
-    # Hyprland reports a bitmask: 1 is maximized, 2 is fullscreen, 3 is both. Only
-    # bit 2 means the window actually covers the screen — a maximized window is just
-    # a window, and the HUD belongs over it.
-    if [[ ${fsmode:-0} =~ ^[0-9]+$ ]] && (( fsmode & 2 )); then
-      hud_suppressed=1
-      suppress_reason="the focused window is fullscreen"
-    fi
-  fi
-
-  # 2. Your notification daemon is in do-not-disturb. The HUD is a notification too,
-  #    and a louder one than the banner, so one toggle should silence both.
-  if [[ $hud_suppressed == 0 && ${CLAUDE_NOTIFY_SKIP_DND:-1} == 1 ]]; then
-    dnd=0
-    if command -v makoctl >/dev/null 2>&1; then
-      # mako modes are arbitrary user-defined strings; do-not-disturb is the
-      # convention, and what omarchy-toggle-notification-silencing flips.
-      makoctl mode 2>/dev/null \
-        | grep -qxF "${CLAUDE_NOTIFY_DND_MODE:-do-not-disturb}" && dnd=1
-    elif command -v dunstctl >/dev/null 2>&1; then
-      [[ $(dunstctl is-paused 2>/dev/null) == true ]] && dnd=1
-    elif command -v swaync-client >/dev/null 2>&1; then
-      [[ $(swaync-client --get-dnd 2>/dev/null) == true ]] && dnd=1
-    fi
-    if [[ $dnd == 1 ]]; then
-      hud_suppressed=1
-      suppress_reason="your notification daemon is in do-not-disturb"
-    fi
+  if should_defer; then
+    defer_turn=1
+    suppress_reason="the focused window is fullscreen; queued for later"
+  elif [[ ${CLAUDE_NOTIFY_SKIP_DND:-1} == 1 ]] && in_do_not_disturb; then
+    hud_suppressed=1
+    suppress_reason="your notification daemon is in do-not-disturb"
   fi
 fi
 
-if [[ $hud_suppressed == 1 && ${CLAUDE_NOTIFY_DEBUG:-0} == 1 ]]; then
-  echo "notify-stop: HUD suppressed, $suppress_reason" >&2
+if [[ -n $suppress_reason && ${CLAUDE_NOTIFY_DEBUG:-0} == 1 ]]; then
+  echo "notify-stop: HUD held back, $suppress_reason" >&2
 fi
 
 # A git pull can bring a newer source than the compiled binary, and nothing else
@@ -211,83 +343,44 @@ if [[ -n $build_error ]]; then
   SECONDS_SHOWN=${CLAUDE_NOTIFY_BLOCKED_SECONDS:-12}
 fi
 
-# Notification Center as well as the HUD: the HUD is gone in seconds, the banner
-# survives in history for when you come back. Silent, so the chime is not doubled.
-if [[ ${CLAUDE_NOTIFY_NATIVE:-1} == 1 ]]; then
-  NOTIFIER=$(command -v terminal-notifier || true)
-  subtitle="${badge:+$badge · }$repo${branch:+ · $branch}"
-  group="claude-code-${badge:-$repo}"
+# Build the card once; it is either shown now or stored verbatim for the replay.
+hud_args=(
+  --title "$glyph ${title:-$repo}"
+  --badge "$badge"
+  --repo "$repo"
+  --branch "$branch"
+  --body "${body:-Turn complete.}"
+  --seconds "$SECONDS_SHOWN"
+  --sound "$SOUND"
+  --volume "$VOLUME"
+)
+[[ -n ${CLAUDE_NOTIFY_ACCENT:-} ]] && hud_args+=(--accent "$CLAUDE_NOTIFY_ACCENT")
+[[ -n ${CLAUDE_NOTIFY_MEMBER:-} ]] && hud_args+=(--member "$CLAUDE_NOTIFY_MEMBER")
+[[ -n ${TMUX_PANE:-} ]] && hud_args+=(--on-click "$here/focus-pane $TMUX_PANE claude-code-${badge:-$repo}")
+hud_args+=(${hud_extra[@]+"${hud_extra[@]}"})
 
-  # The HUD is transient and already on your screen; this banner persists in
-  # Notification Center, so it carries no message text by default. A turn that
-  # discussed a token or a .env path would otherwise leave it sitting outside the
-  # terminal. Opt back in with CLAUDE_NOTIFY_NATIVE_BODY=1.
-  if [[ ${CLAUDE_NOTIFY_NATIVE_BODY:-0} == 1 ]]; then
-    banner=${body:-Turn complete.}
-  elif [[ $event == Notification ]]; then
-    banner="Waiting on you${badge:+ — open $badge}"
-  else
-    banner="Finished${badge:+ — open $badge}"
-  fi
-  [[ ${CLAUDE_NOTIFY_DEBUG:-0} == 1 ]] && echo "notify-stop: banner=[$banner]" >&2
-  if [[ $os == linux ]] && command -v notify-send >/dev/null 2>&1; then
-    # x-canonical-private-synchronous is the freedesktop counterpart of
-    # terminal-notifier's -group: a second banner for the same pane replaces the
-    # first instead of stacking another copy in the tray.
-    args=(-a "Claude Code"
-          -u "$([[ $event == Notification ]] && echo critical || echo normal)"
-          -h "string:x-canonical-private-synchronous:$group"
-          -h "string:desktop-entry:claude-code")
-    [[ -n ${CLAUDE_NOTIFY_ICON:-} ]] && args+=(-i "$CLAUDE_NOTIFY_ICON")
-    if [[ -n ${TMUX_PANE:-} ]]; then
-      # --wait blocks for the life of the banner and then prints the key of
-      # whatever was pressed, so the whole thing is detached and acts afterwards.
-      (
-        chosen=$(notify-send "${args[@]}" -A "focus=Open ${badge:-$repo}" --wait \
-                   "$glyph ${title:-$repo}" "$subtitle"$'\n'"$banner" 2>/dev/null)
-        [[ $chosen == focus ]] && "$here/focus-pane" "$TMUX_PANE" "$group"
-      ) >/dev/null 2>&1 &
-    else
-      notify-send "${args[@]}" "$glyph ${title:-$repo}" "$subtitle"$'\n'"$banner" \
-        >/dev/null 2>&1 &
-    fi
-  elif [[ -n $NOTIFIER ]]; then
-    # terminal-notifier can run a command on click; osascript cannot.
-    args=(-title "$glyph ${title:-$repo}" -subtitle "$subtitle" -message "$banner"
-          -group "$group")
-    [[ -n ${TMUX_PANE:-} ]] && args+=(-execute "$here/focus-pane $TMUX_PANE $group")
-    [[ -n ${CLAUDE_NOTIFY_NATIVE_SOUND:-} ]] && args+=(-sound "$CLAUDE_NOTIFY_NATIVE_SOUND")
-    "$NOTIFIER" "${args[@]}" >/dev/null 2>&1 &
-  elif [[ $os == mac ]]; then
-    /usr/bin/osascript - "$glyph ${title:-$repo}" "$subtitle" "$banner" >/dev/null 2>&1 <<'APPLESCRIPT' &
-on run argv
-  display notification (item 3 of argv) with title (item 1 of argv) subtitle (item 2 of argv)
-end run
-APPLESCRIPT
-  fi
+# The banner is transient and already on your screen; this one persists in the
+# tray, so it carries no message text by default. A turn that discussed a token or
+# a .env path would otherwise leave it sitting outside the terminal. Opt back in
+# with CLAUDE_NOTIFY_NATIVE_BODY=1.
+headline="$glyph ${title:-$repo}"
+subtitle="${badge:+$badge · }$repo${branch:+ · $branch}"
+group="claude-code-${badge:-$repo}"
+if [[ ${CLAUDE_NOTIFY_NATIVE_BODY:-0} == 1 ]]; then
+  banner=${body:-Turn complete.}
+elif [[ $event == Notification ]]; then
+  banner="Waiting on you${badge:+ — open $badge}"
+else
+  banner="Finished${badge:+ — open $badge}"
 fi
 
-if [[ $hud_suppressed == 1 ]]; then
-  disown 2>/dev/null || true
+if [[ $defer_turn == 1 ]]; then
+  queue_push "$headline" "$subtitle" "$banner" "$group" "$event" "${TMUX_PANE:-}" "${hud_args[@]}"
+  ensure_watcher
   exit 0
 fi
 
-"$HUD" \
-  --title "$glyph ${title:-$repo}" \
-  --badge "$badge" \
-  --repo "$repo" \
-  --branch "$branch" \
-  --body "${body:-Turn complete.}" \
-  --seconds "$SECONDS_SHOWN" \
-  --sound "$SOUND" \
-  --volume "$VOLUME" \
-  ${CLAUDE_NOTIFY_ACCENT:+--accent "$CLAUDE_NOTIFY_ACCENT"} \
-  ${CLAUDE_NOTIFY_MEMBER:+--member "$CLAUDE_NOTIFY_MEMBER"} \
-  ${TMUX_PANE:+--on-click "$here/focus-pane $TMUX_PANE claude-code-${badge:-$repo}"} \
-  ${hud_extra[@]+"${hud_extra[@]}"} \
-  >/dev/null 2>&1 &
-
-# Detached: the hook must not sit for the HUD's whole display time. Its 10s
-# timeout would otherwise cut a 12s blocked notification short.
-disown 2>/dev/null || true
+emit_banner "$headline" "$subtitle" "$banner" "$group" "$event" "${TMUX_PANE:-}"
+[[ $hud_suppressed == 1 ]] && exit 0
+emit_hud "${hud_args[@]}"
 exit 0

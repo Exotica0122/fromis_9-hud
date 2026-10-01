@@ -91,7 +91,7 @@ else
   note "skipped: this pane is not on screen in an attached session"
 fi
 
-echo "fullscreen"
+echo "fullscreen defers the turn"
 # Stub compositor and notification daemon rather than the real ones: the suite must
 # assert the same thing whatever is fullscreen, and whatever mode mako is in, while
 # it runs. Both are stubbed throughout so neither rule can mask the other.
@@ -111,40 +111,103 @@ exit 0
 STUB
   chmod +x "$fake/makoctl"
 }
-if [[ $(uname) == Linux ]]; then
-  mako_stub default
-  hypr_stub 2
-  args=$(run "$(payload Stop)" PATH="$fake:$PATH" CLAUDE_NOTIFY_NATIVE=0)
-  [[ -z $args ]] && ok "a fullscreen window suppresses the card" \
-                 || bad "a fullscreen window suppresses the card" "rendered anyway"
+# The shared stub truncates; replaying a batch needs every call kept.
+cat > "$tmp/stub-many" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$CLAUDE_TEST_ARGS"
+STUB
+chmod +x "$tmp/stub-many"
 
-  # The banner is the whole point of suppressing rather than exiting early: the turn
-  # still has to be waiting for you when you tab out of the game.
+if [[ $(uname) == Linux ]]; then
+  queue=$tmp/deferred.jsonl
+  # MAX_WAIT keeps the watchers these assertions spawn from outliving the suite;
+  # the replay case below gets its own queue, and so its own lock and watcher.
+  defer_env=(PATH="$fake:$PATH" CLAUDE_NOTIFY_DEFER_QUEUE="$queue"
+             CLAUDE_NOTIFY_DEFER_POLL=1 CLAUDE_NOTIFY_DEFER_MAX_WAIT=30
+             CLAUDE_NOTIFY_NATIVE=0)
+  # These assertions only care about the decision, not the replay. Draining the
+  # queue after each one retires the watcher it spawned — left running, it would
+  # flush into the shared stub the moment a later case stops being fullscreen, and
+  # that case would read the stale card as its own.
+  drain() { : > "$queue"; }
+  mako_stub default
+
+  hypr_stub 2
+  args=$(run "$(payload Stop)" "${defer_env[@]}")
+  [[ -z $args ]] && ok "a fullscreen window defers the card" \
+                 || bad "a fullscreen window defers the card" "rendered anyway"
+  [[ -s $queue ]] && ok "and parks the turn in the queue" \
+                  || bad "and parks the turn in the queue" "nothing queued"
+  drain
+
+  # mako draws on the overlay layer too, so a banner lands over the game just as
+  # the card would. Deferring has to mean both or it has not helped.
   out=$(printf '%s' "$(payload Stop)" \
-    | env PATH="$fake:$PATH" CLAUDE_NOTIFY_DEBUG=1 "$here/notify-stop" 2>&1 >/dev/null)
-  check "and still records it in a banner"    "$out" "banner=["
-  check "saying why it went quiet"            "$out" "focused window is fullscreen"
+    | env PATH="$fake:$PATH" CLAUDE_NOTIFY_DEFER_QUEUE="$queue" \
+          CLAUDE_NOTIFY_DEBUG=1 "$here/notify-stop" 2>&1 >/dev/null)
+  absent "and holds the banner back with it"  "$out" "banner=["
+  check  "saying it was queued"               "$out" "queued for later"
+  drain
 
   hypr_stub 1
-  args=$(run "$(payload Stop)" PATH="$fake:$PATH" CLAUDE_NOTIFY_NATIVE=0)
+  args=$(run "$(payload Stop)" "${defer_env[@]}")
   [[ -n $args ]] && ok "a merely maximized window does not" \
                  || bad "a merely maximized window does not" "stayed silent"
 
   hypr_stub 3                  # maximized|fullscreen, the bitmask case
-  args=$(run "$(payload Stop)" PATH="$fake:$PATH" CLAUDE_NOTIFY_NATIVE=0)
+  args=$(run "$(payload Stop)" "${defer_env[@]}")
   [[ -z $args ]] && ok "maximized|fullscreen still counts as fullscreen" \
                  || bad "maximized|fullscreen still counts as fullscreen" "rendered anyway"
+  drain
 
   hypr_stub 2
-  args=$(run "$(payload Stop)" PATH="$fake:$PATH" CLAUDE_NOTIFY_NATIVE=0 CLAUDE_NOTIFY_ALWAYS=1)
+  args=$(run "$(payload Stop)" "${defer_env[@]}" CLAUDE_NOTIFY_ALWAYS=1)
   [[ -n $args ]] && ok "CLAUDE_NOTIFY_ALWAYS overrides it" \
                  || bad "CLAUDE_NOTIFY_ALWAYS overrides it" "stayed silent"
-
-  args=$(run "$(payload Stop)" PATH="$fake:$PATH" CLAUDE_NOTIFY_NATIVE=0 CLAUDE_NOTIFY_SKIP_FULLSCREEN=0)
+  args=$(run "$(payload Stop)" "${defer_env[@]}" CLAUDE_NOTIFY_SKIP_FULLSCREEN=0)
   [[ -n $args ]] && ok "CLAUDE_NOTIFY_SKIP_FULLSCREEN=0 turns it off" \
                  || bad "CLAUDE_NOTIFY_SKIP_FULLSCREEN=0 turns it off" "stayed silent"
+
+  echo "and replays it afterwards"
+  # Three turns pile up behind a fullscreen window, then the window goes away. Its
+  # own queue path, so it gets its own lock and a watcher carrying this stub rather
+  # than inheriting one left polling by the assertions above.
+  rq=$tmp/replay-queue.jsonl
+  replay=$tmp/replay; : > "$replay"
+  replay_env=(PATH="$fake:$PATH" CLAUDE_NOTIFY_DEFER_QUEUE="$rq"
+              CLAUDE_NOTIFY_DEFER_POLL=1 CLAUDE_NOTIFY_DEFER_MAX_WAIT=60
+              CLAUDE_NOTIFY_NATIVE=0
+              CLAUDE_HUD_BIN="$tmp/stub-many" CLAUDE_TEST_ARGS="$replay")
+  hypr_stub 2
+  for pane in alpha beta gamma; do
+    printf '%s' "$(payload Stop)" \
+      | env "${replay_env[@]}" CLAUDE_NOTIFY_MEMBER="$pane" \
+            "$here/notify-stop" >/dev/null 2>&1
+  done
+  queued=$(wc -l <"$rq" 2>/dev/null || echo 0)
+  [[ $queued -eq 3 ]] && ok "three turns queue up, none shown" \
+                      || bad "three turns queue up, none shown" "queued=$queued shown=$(wc -l <"$replay")"
+
+  hypr_stub 0                  # the game closes
+  for _ in $(seq 1 20); do
+    [[ $(wc -l <"$replay" 2>/dev/null || echo 0) -ge 3 ]] && break
+    sleep 1
+  done
+  shown=$(wc -l <"$replay" 2>/dev/null || echo 0)
+  [[ $shown -eq 3 ]] && ok "all three replay once it is gone" \
+                     || bad "all three replay once it is gone" "only $shown replayed"
+  order=$(grep -oE -- '--member [a-z]+' "$replay" | awk '{print $2}' | tr '\n' ' ')
+  [[ $order == "alpha beta gamma " ]] && ok "oldest first, so the newest lands on top" \
+                                      || bad "oldest first, so the newest lands on top" "got: $order"
+  chimes=$(( $(grep -c . "$replay") - $(grep -c -- '--sound none' "$replay") ))
+  [[ $chimes -eq 1 ]] && ok "one chime for the batch, not one per turn" \
+                      || bad "one chime for the batch, not one per turn" "$chimes cards would chime"
+  [[ ! -s $rq ]] && ok "the queue is drained" \
+                 || bad "the queue is drained" "$(wc -l <"$rq") left behind"
+  rm -f "$fake/hyprctl" "$fake/makoctl" "$queue" "$rq"
+  rmdir "$queue.lock" "$rq.lock" 2>/dev/null       # mkdir is the lock, so rm -f will not do
 else
-  note "skipped: fullscreen suppression has no macOS probe yet"
+  note "skipped: deferral has no macOS probe yet"
 fi
 
 echo "do-not-disturb"
